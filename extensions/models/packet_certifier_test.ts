@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { model } from "./packet_certifier.ts";
 
 type Snapshot = {
-  hashVersion: "packet-certifier-v5";
+  hashVersion: "packet-certifier-v6";
   packetId: string;
   invocationId: string;
   resolvedBaseSha: string;
@@ -11,6 +11,7 @@ type Snapshot = {
   fileCount: number;
   stateHash: string;
   ignoredScope?: "application-owned-v1";
+  excludedIgnoredPathPrefixes: string[];
   capturedAt: string;
 };
 
@@ -36,6 +37,7 @@ type Harness = {
     globalArgs: {
       allowedIgnoredPaths: string[];
       allowedIgnoredPathPrefixes: string[];
+      excludedIgnoredPathPrefixes: string[];
     };
     readResource: (name: string) => Promise<Record<string, unknown> | null>;
     writeResource: (
@@ -49,6 +51,7 @@ type Harness = {
 function harness(globalArgs: {
   allowedIgnoredPaths?: string[];
   allowedIgnoredPathPrefixes?: string[];
+  excludedIgnoredPathPrefixes?: string[];
 } = {}): Harness {
   const store = new Map<string, Record<string, unknown>>();
   return {
@@ -57,6 +60,8 @@ function harness(globalArgs: {
       globalArgs: {
         allowedIgnoredPaths: globalArgs.allowedIgnoredPaths ?? [],
         allowedIgnoredPathPrefixes: globalArgs.allowedIgnoredPathPrefixes ?? [],
+        excludedIgnoredPathPrefixes: globalArgs.excludedIgnoredPathPrefixes ??
+          [],
       },
       readResource: (name) => Promise.resolve(store.get(name) ?? null),
       writeResource: (_spec, name, payload) => {
@@ -249,6 +254,7 @@ Deno.test("method schemas accept Swamp-injected global arguments", () => {
   const globalArgs = {
     allowedIgnoredPaths: [],
     allowedIgnoredPathPrefixes: [".swamp/"],
+    excludedIgnoredPathPrefixes: [".runtime/"],
   };
 
   assertEquals(
@@ -376,6 +382,132 @@ Deno.test("detects ignored content and permission changes", async () => {
     assertEquals(
       [...h.store.values()].find((value) => value.capturedAt)?.stateHash,
       before.stateHash,
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("fails closed on an unapproved large ignored tree", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, ".runtime/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore runtime"]);
+    await Deno.mkdir(`${cwd}/.runtime`);
+    for (let i = 0; i <= 1_000; i++) {
+      await Deno.writeTextFile(`${cwd}/.runtime/${i}`, "generated\n");
+    }
+
+    await assertRejects(
+      () => snapshot(cwd, harness()),
+      Error,
+      "inventory exceeds path limit",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("explicitly excludes a large ignored runtime tree while hashing protected ignored files", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(
+      `${cwd}/.gitignore`,
+      ".runtime/\n.protected/\n",
+    );
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore runtime state"]);
+    await Deno.mkdir(`${cwd}/.runtime`);
+    await Deno.mkdir(`${cwd}/.protected`);
+    await Deno.writeTextFile(`${cwd}/.protected/config`, "before\n", {
+      mode: 0o600,
+    });
+    for (let i = 0; i <= 1_000; i++) {
+      await Deno.writeTextFile(`${cwd}/.runtime/${i}`, "generated\n");
+    }
+    const h = harness({
+      allowedIgnoredPaths: [".protected/config"],
+      excludedIgnoredPathPrefixes: [".runtime/"],
+    });
+    const before = await snapshot(cwd, h);
+
+    assertEquals(before.fileCount, 1);
+    assertEquals(before.excludedIgnoredPathPrefixes, [".runtime/"]);
+    assertEquals((await certify(cwd, h, ["README.md"])).passed, true);
+
+    await Deno.writeTextFile(`${cwd}/.protected/config`, "after\n", {
+      mode: 0o700,
+    });
+    assertEquals((await certify(cwd, h, ["README.md"])).passed, false);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("binds excluded ignored prefixes to the invocation snapshot", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, ".runtime/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore runtime"]);
+    await Deno.mkdir(`${cwd}/.runtime`);
+    const h = harness({ excludedIgnoredPathPrefixes: [".runtime/"] });
+    await snapshot(cwd, h);
+    h.context.globalArgs.excludedIgnoredPathPrefixes = [];
+
+    await assertRejects(
+      () => certify(cwd, h, ["README.md"]),
+      Error,
+      "excluded ignored path policy differs",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test({
+  name: "rejects symlinks at an excluded ignored prefix",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const cwd = await createRepo();
+    const outside = await Deno.makeTempDir();
+    try {
+      await Deno.writeTextFile(`${cwd}/.gitignore`, ".runtime/\n");
+      await gitOutput(cwd, ["add", ".gitignore"]);
+      await gitOutput(cwd, ["commit", "-m", "ignore runtime"]);
+      await Deno.symlink(outside, `${cwd}/.runtime`);
+
+      await assertRejects(
+        () =>
+          snapshot(
+            cwd,
+            harness({ excludedIgnoredPathPrefixes: [".runtime/"] }),
+          ),
+        Error,
+        "excluded ignored prefix crosses symlink",
+      );
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+      await Deno.remove(outside, { recursive: true });
+    }
+  },
+});
+
+Deno.test("rejects tracked Swamp state as certification infrastructure", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.mkdir(`${cwd}/.swamp`);
+    await Deno.writeTextFile(`${cwd}/.swamp/state`, "tracked\n");
+    await gitOutput(cwd, ["add", "-f", ".swamp/state"]);
+    await gitOutput(cwd, ["commit", "-m", "track swamp state"]);
+    const h = harness();
+    h.context.repoDir = cwd;
+
+    await assertRejects(
+      () => snapshot(cwd, h),
+      Error,
+      "tracked .swamp paths",
     );
   } finally {
     await Deno.remove(cwd, { recursive: true });

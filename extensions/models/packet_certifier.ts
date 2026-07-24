@@ -5,7 +5,7 @@
  */
 import { z } from "npm:zod@4.4.3";
 
-const HASH_VERSION = "packet-certifier-v5";
+const HASH_VERSION = "packet-certifier-v6";
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_PATHS = 1_000;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -29,6 +29,7 @@ const SnapshotBindingSchema = z.object({
   fileCount: Count.max(MAX_PATHS),
   stateHash: HashString,
   ignoredScope: z.literal(IGNORED_SCOPE).optional(),
+  excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
 }).strict();
 
 const IgnoredSnapshotSchema = SnapshotBindingSchema.extend({
@@ -94,6 +95,7 @@ const ReportSchema = z.object({
     allowBinary: z.literal(false),
     allowedIgnoredPaths: z.array(PathString).max(MAX_PATHS),
     allowedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
+    excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
   }).strict(),
   passed: z.boolean(),
   checkedAt: z.string().datetime(),
@@ -102,6 +104,7 @@ const ReportSchema = z.object({
 const GlobalArgsSchema = z.object({
   allowedIgnoredPaths: z.array(PathString).max(MAX_PATHS).default([]),
   allowedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS).default([]),
+  excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS).default([]),
 }).strict();
 
 type ModelContext = {
@@ -344,8 +347,11 @@ async function list(
   cwd: string,
   args: string[],
   label: string,
+  literalPathspecs = true,
 ): Promise<string[]> {
-  return decodeZ((await command(cwd, label, args)).stdout);
+  return decodeZ(
+    (await command(cwd, label, args, [0], literalPathspecs)).stdout,
+  );
 }
 
 async function topLevelPathspecs(
@@ -370,18 +376,27 @@ async function topLevelPathspecs(
 async function listIgnoredPaths(
   cwd: string,
   excludeRuntimeSwamp: boolean,
+  excludedPrefixes: string[],
 ): Promise<string[]> {
   const pathspecs = await topLevelPathspecs(cwd, excludeRuntimeSwamp);
   if (!pathspecs.length) return [];
-  return await list(cwd, [
-    "ls-files",
-    "--others",
-    "--ignored",
-    "--exclude-standard",
-    "-z",
-    "--",
-    ...pathspecs,
-  ], "git ls-files ignored");
+  return await list(
+    cwd,
+    [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...pathspecs.map((path) => `:(literal)${path}`),
+      ...excludedPrefixes.map((prefix) =>
+        `:(exclude,literal)${prefix.slice(0, -1)}`
+      ),
+    ],
+    "git ls-files ignored",
+    false,
+  );
 }
 
 async function excludesRuntimeSwamp(
@@ -421,6 +436,58 @@ async function excludesRuntimeSwamp(
   return true;
 }
 
+async function validateExcludedIgnoredPrefixes(
+  cwd: string,
+  prefixes: string[],
+): Promise<void> {
+  for (const prefix of prefixes) {
+    const root = prefix.slice(0, -1);
+    const segments = root.split("/");
+    for (let i = 1; i <= segments.length; i++) {
+      const ancestor = segments.slice(0, i).join("/");
+      try {
+        const stat = await Deno.lstat(`${cwd}/${ancestor}`);
+        if (stat.isSymlink) {
+          throw new Error(
+            `excluded ignored prefix crosses symlink: ${ancestor}`,
+          );
+        }
+        if (i === segments.length && !stat.isDirectory) {
+          throw new Error(
+            `excluded ignored prefix is not a directory: ${root}`,
+          );
+        }
+      } catch (error) {
+        if (error instanceof Deno.errors.NotFound) {
+          throw new Error(`excluded ignored prefix does not exist: ${root}`);
+        }
+        throw error;
+      }
+    }
+    if (
+      (await list(
+        cwd,
+        ["ls-files", "-z", "--", root],
+        "git ls-files excluded ignored prefix",
+      )).length
+    ) {
+      throw new Error(
+        `excluded ignored prefix contains tracked paths: ${root}`,
+      );
+    }
+    const ignored = await command(
+      cwd,
+      "git check-ignore excluded prefix",
+      ["check-ignore", "-q", "--no-index", "--", root],
+      [0, 1],
+      false,
+    );
+    if (ignored.code !== 0) {
+      throw new Error(`excluded ignored prefix is not ignored by Git: ${root}`);
+    }
+  }
+}
+
 function ignoredAllowed(
   path: string,
   exact: Set<string>,
@@ -432,6 +499,7 @@ function ignoredAllowed(
 async function ignoredSnapshot(
   cwd: string,
   paths: string[],
+  excludedPrefixes: string[],
   packetId: string,
   invocationId: string,
   resolvedBaseSha: string,
@@ -461,6 +529,7 @@ async function ignoredSnapshot(
     fileCount: paths.length,
     stateHash: await canonicalHash(parts),
     ignoredScope: IGNORED_SCOPE,
+    excludedIgnoredPathPrefixes: excludedPrefixes,
   };
 }
 
@@ -564,8 +633,12 @@ async function baseTree(cwd: string, base: string): Promise<BaseEntry[]> {
 async function finalTree(
   cwd: string,
   excludeRuntimeSwamp: boolean,
+  excludedPrefixes: string[],
 ): Promise<FinalEntry[]> {
   const pending = [cwd];
+  const excludedRoots = new Set(
+    excludedPrefixes.map((prefix) => prefix.slice(0, -1)),
+  );
   let count = 0;
   const files: FinalEntry[] = [];
   while (pending.length) {
@@ -576,23 +649,31 @@ async function finalTree(
         excludeRuntimeSwamp && directory === cwd && entry.name === ".swamp" &&
         entry.isDirectory
       ) continue;
+      const path = `${directory}/${entry.name}`;
+      const relative = path.slice(cwd.length + 1);
+      if (excludedRoots.has(relative)) {
+        if (!entry.isDirectory || entry.isSymlink) {
+          throw new Error(
+            `excluded ignored prefix is not a directory: ${relative}`,
+          );
+        }
+        continue;
+      }
       count++;
       if (count > MAX_PATHS * 10) {
         throw new Error("filesystem inventory exceeds entry limit");
       }
-      const path = `${directory}/${entry.name}`;
       if (entry.name === ".git") {
         throw new Error(
-          `refusing nested repository: ${path.slice(cwd.length + 1)}`,
+          `refusing nested repository: ${relative}`,
         );
       }
       if (entry.isDirectory) pending.push(path);
       else if (!entry.isFile) {
         throw new Error(
-          `refusing non-regular file: ${path.slice(cwd.length + 1)}`,
+          `refusing non-regular file: ${relative}`,
         );
       } else {
-        const relative = path.slice(cwd.length + 1);
         validateRepoPath(relative);
         const stat = await Deno.lstat(path);
         files.push({ path: relative, mode: (stat.mode ?? 0) & 0o777 });
@@ -743,24 +824,54 @@ async function worktreeHash(
 
 function ignoredPolicy(
   context: ModelContext,
-): { exact: Set<string>; prefixes: string[] } {
+): { exact: Set<string>; prefixes: string[]; excludedPrefixes: string[] } {
   const exact = context.globalArgs?.allowedIgnoredPaths ?? [];
   const prefixes = context.globalArgs?.allowedIgnoredPathPrefixes ?? [];
+  const excludedPrefixes = context.globalArgs?.excludedIgnoredPathPrefixes ??
+    [];
   for (const path of exact) validateRepoPath(path);
-  for (const prefix of prefixes) {
+  for (const prefix of [...prefixes, ...excludedPrefixes]) {
     if (!prefix.endsWith("/")) {
       throw new Error("ignored path prefix must end with /");
     }
     validateRepoPath(prefix.slice(0, -1));
   }
-  return { exact: new Set(exact), prefixes };
+  if (excludedPrefixes.some((prefix) => prefix.startsWith(":"))) {
+    throw new Error("excluded ignored path prefix cannot start with colon");
+  }
+  if (new Set(excludedPrefixes).size !== excludedPrefixes.length) {
+    throw new Error("excluded ignored path prefixes must be unique");
+  }
+  for (const excluded of excludedPrefixes) {
+    if (
+      [...exact].some((path) => path.startsWith(excluded)) ||
+      prefixes.some((prefix) =>
+        excluded.startsWith(prefix) || prefix.startsWith(excluded)
+      )
+    ) {
+      throw new Error("allowed and excluded ignored path policies overlap");
+    }
+  }
+  return {
+    exact: new Set(exact),
+    prefixes,
+    excludedPrefixes: excludedPrefixes.toSorted(),
+  };
 }
 
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.24.2",
+  version: "2026.07.24.3",
   globalArguments: GlobalArgsSchema,
+  upgrades: [{
+    toVersion: "2026.07.24.3",
+    description: "Add explicit excluded ignored path prefixes",
+    upgradeAttributes: (old: Record<string, unknown>) => ({
+      ...old,
+      excludedIgnoredPathPrefixes: [],
+    }),
+  }],
   resources: {
     ignoredSnapshot: {
       description: "Pre-invocation ignored-state evidence",
@@ -804,8 +915,13 @@ export const model = {
         const excludeRuntimeSwamp = await excludesRuntimeSwamp(cwd, context);
         const resolvedBaseSha = await resolveBase(cwd, args.baseRef as string);
         const format = await objectFormat(cwd);
-        const paths = await listIgnoredPaths(cwd, excludeRuntimeSwamp);
         const policy = ignoredPolicy(context);
+        await validateExcludedIgnoredPrefixes(cwd, policy.excludedPrefixes);
+        const paths = await listIgnoredPaths(
+          cwd,
+          excludeRuntimeSwamp,
+          policy.excludedPrefixes,
+        );
         const violation = paths.find((path) =>
           !ignoredAllowed(path, policy.exact, policy.prefixes)
         );
@@ -818,6 +934,7 @@ export const model = {
           ...await ignoredSnapshot(
             cwd,
             paths,
+            policy.excludedPrefixes,
             packetId,
             invocationId,
             resolvedBaseSha,
@@ -885,6 +1002,16 @@ export const model = {
         await rejectExecutableFilters(cwd);
         await rejectLazyFetchConfiguration(cwd);
         const excludeRuntimeSwamp = await excludesRuntimeSwamp(cwd, context);
+        const policy = ignoredPolicy(context);
+        if (
+          JSON.stringify(expected.excludedIgnoredPathPrefixes) !==
+            JSON.stringify(policy.excludedPrefixes)
+        ) {
+          throw new Error(
+            "excluded ignored path policy differs from pre-invocation snapshot",
+          );
+        }
+        await validateExcludedIgnoredPrefixes(cwd, policy.excludedPrefixes);
         const base = expected.resolvedBaseSha;
         await command(cwd, "git fsck base", [
           "fsck",
@@ -896,8 +1023,16 @@ export const model = {
         await preflightIndex(cwd);
         await requireUnstagedOnly(cwd);
         const baseEntries = await baseTree(cwd, base);
-        const finalEntries = await finalTree(cwd, excludeRuntimeSwamp);
-        const ignoredPaths = await listIgnoredPaths(cwd, excludeRuntimeSwamp);
+        const finalEntries = await finalTree(
+          cwd,
+          excludeRuntimeSwamp,
+          policy.excludedPrefixes,
+        );
+        const ignoredPaths = await listIgnoredPaths(
+          cwd,
+          excludeRuntimeSwamp,
+          policy.excludedPrefixes,
+        );
         const changes = await collectChanges(
           cwd,
           baseEntries,
@@ -905,7 +1040,6 @@ export const model = {
           new Set(ignoredPaths),
           expected.objectFormat,
         );
-        const policy = ignoredPolicy(context);
         const ignoredPathViolations = ignoredPaths.filter((path) =>
           !ignoredAllowed(path, policy.exact, policy.prefixes)
         );
@@ -920,10 +1054,13 @@ export const model = {
             rootBinding: await rootBinding(cwd),
             fileCount: ignoredPaths.length,
             stateHash: await canonicalHash([]),
+            ignoredScope: IGNORED_SCOPE,
+            excludedIgnoredPathPrefixes: policy.excludedPrefixes,
           }
           : await ignoredSnapshot(
             cwd,
             ignoredPaths,
+            policy.excludedPrefixes,
             packetId,
             invocationId,
             base,
@@ -934,6 +1071,7 @@ export const model = {
           : await ignoredSnapshot(
             cwd,
             ignoredPaths,
+            policy.excludedPrefixes,
             packetId,
             invocationId,
             base,
@@ -1010,6 +1148,7 @@ export const model = {
             allowBinary: false as const,
             allowedIgnoredPaths: [...policy.exact],
             allowedIgnoredPathPrefixes: policy.prefixes,
+            excludedIgnoredPathPrefixes: policy.excludedPrefixes,
           },
           passed,
           checkedAt: new Date().toISOString(),
