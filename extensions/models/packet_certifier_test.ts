@@ -198,6 +198,38 @@ Deno.test("certifies ordinary unstaged text without persisting absolute roots", 
   }
 });
 
+Deno.test("certifies a repository larger than the packet path ceiling", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.mkdir(`${cwd}/fixtures`);
+    for (let i = 0; i <= 1_000; i++) {
+      await Deno.writeTextFile(`${cwd}/fixtures/${i}`, "fixture\n");
+    }
+    await gitOutput(cwd, ["add", "fixtures"]);
+    await gitOutput(cwd, [
+      "-c",
+      "user.name=Packet Certifier Test",
+      "-c",
+      "user.email=packet-certifier@example.test",
+      "commit",
+      "-m",
+      "large repository",
+    ]);
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+
+    const report = await certify(cwd, h, ["README.md"]);
+
+    assertEquals(report.passed, true);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 Deno.test("uses immutable extension-owned snapshots", async () => {
   const cwd = await createRepo();
   try {

@@ -160,10 +160,12 @@ are disabled. Symlinks, special files, nested repositories, gitlinks,
 unsupported base objects, unmerged entries, and staged state are rejected.
 
 Each file is limited to 10 MiB, aggregate inspected state to 50 MiB, Git output
-to 4 MiB, inventories to conservative fixed counts, and commands to 30 seconds.
-Disallowed ignored paths are reported before their contents are read. The
-published targets are Apple Silicon macOS and x86-64 Linux with Git 2.37+ and
-Deno; Windows is not currently supported or claimed.
+to 4 MiB, packet/ignored inventories to 1,000 paths, repository inventories to
+10,000 paths, and commands to 30 seconds. Repository inventory limits are
+separate from the number of paths a packet may change. Disallowed ignored paths
+are reported before their contents are read. The published targets are Apple
+Silicon macOS and x86-64 Linux with Git 2.37+ and Deno; Windows is not currently
+supported or claimed.
 
 Ignored files require a separate policy because Git does not retain their
 previous content. The snapshot method hashes the bounded application-owned

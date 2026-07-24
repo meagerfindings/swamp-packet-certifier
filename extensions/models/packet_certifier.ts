@@ -8,6 +8,7 @@ import { z } from "npm:zod@4.4.3";
 const HASH_VERSION = "packet-certifier-v6";
 const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_PATHS = 1_000;
+const MAX_REPOSITORY_PATHS = 10_000;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
@@ -570,7 +571,7 @@ async function preflightIndex(cwd: string): Promise<void> {
   ]);
   const text = new TextDecoder("utf-8", { fatal: true }).decode(output.stdout);
   const records = text.split("\0");
-  if (records.pop() !== "" || records.length > MAX_PATHS) {
+  if (records.pop() !== "" || records.length > MAX_REPOSITORY_PATHS) {
     throw new Error("malformed or oversized index inventory");
   }
   for (const record of records) {
@@ -615,7 +616,7 @@ async function baseTree(cwd: string, base: string): Promise<BaseEntry[]> {
   ]);
   const text = new TextDecoder("utf-8", { fatal: true }).decode(output.stdout);
   const records = text.split("\0");
-  if (records.pop() !== "" || records.length > MAX_PATHS) {
+  if (records.pop() !== "" || records.length > MAX_REPOSITORY_PATHS) {
     throw new Error("malformed or oversized base-tree inventory");
   }
   return records.map((record) => {
@@ -660,7 +661,7 @@ async function finalTree(
         continue;
       }
       count++;
-      if (count > MAX_PATHS * 10) {
+      if (count > MAX_REPOSITORY_PATHS) {
         throw new Error("filesystem inventory exceeds entry limit");
       }
       if (entry.name === ".git") {
@@ -680,7 +681,7 @@ async function finalTree(
       }
     }
   }
-  if (files.length > MAX_PATHS) {
+  if (files.length > MAX_REPOSITORY_PATHS) {
     throw new Error("final tree exceeds path limit");
   }
   return files;
@@ -862,7 +863,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.24.3",
+  version: "2026.07.24.4",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -871,6 +872,10 @@ export const model = {
       ...old,
       excludedIgnoredPathPrefixes: [],
     }),
+  }, {
+    toVersion: "2026.07.24.4",
+    description: "Separate repository and packet inventory ceilings",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
     ignoredSnapshot: {
