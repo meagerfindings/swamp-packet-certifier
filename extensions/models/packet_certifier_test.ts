@@ -782,6 +782,21 @@ Deno.test("tracks executable-bit-only changes even when repo config disables the
   }
 });
 
+Deno.test("ignores tracked permission bits Git does not store", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.chmod(`${cwd}/README.md`, 0o664);
+    const h = harness();
+    await snapshot(cwd, h);
+    const report = await certify(cwd, h, ["README.md"]);
+
+    assertEquals(report.changedFiles, []);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 Deno.test("rejects existing gitlinks and nested repositories", async () => {
   const gitlink = await createRepo();
   try {

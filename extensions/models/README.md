@@ -158,6 +158,9 @@ configuration, replacement refs, and executable content filters are rejected,
 while fsmonitor/hooks/external diff/text conversion/global/system configuration
 are disabled. Symlinks, special files, nested repositories, gitlinks,
 unsupported base objects, unmerged entries, and staged state are rejected.
+Tracked file permissions are normalized to Git's executable-bit-only
+`100644`/`100755` model; ignored-file evidence continues to hash all POSIX
+permission bits.
 
 Each file is limited to 10 MiB, aggregate inspected state to 50 MiB, Git output
 to 4 MiB, packet/ignored inventories to 1,000 paths, repository inventories to

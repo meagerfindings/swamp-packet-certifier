@@ -715,6 +715,10 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
     left.every((byte, i) => byte === right[i]);
 }
 
+function gitMode(mode: number): number {
+  return mode & 0o111 ? 0o755 : 0o644;
+}
+
 async function collectChanges(
   cwd: string,
   base: BaseEntry[],
@@ -744,7 +748,8 @@ async function collectChanges(
       throw new Error("tracked state exceeds aggregate byte limit");
     }
     if (
-      equalBytes(baseBytes, finalFile.bytes) && entry.mode === finalFile.mode
+      equalBytes(baseBytes, finalFile.bytes) &&
+      entry.mode === gitMode(finalFile.mode)
     ) {
       continue;
     }
@@ -863,7 +868,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.24.4",
+  version: "2026.07.24.5",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -875,6 +880,10 @@ export const model = {
   }, {
     toVersion: "2026.07.24.4",
     description: "Separate repository and packet inventory ceilings",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.07.24.5",
+    description: "Normalize tracked permissions to Git file modes",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
