@@ -12,7 +12,7 @@ swamp extension pull @mgreten/packet-certifier
 
 ## Setup
 
-Create one persistent model in the repository whose worktrees will be certified. The default policy permits no ignored files. Explicitly allow every ignored runtime path the implementation may coexist with; allowed contents are still hashed and must remain unchanged between snapshot and certification.
+Create one persistent model in the repository whose worktrees will be certified. The default policy permits no application-owned ignored files. Explicitly allow every ignored runtime path the implementation may coexist with; allowed contents are still hashed and must remain unchanged between snapshot and certification. Swamp-owned `.swamp/` state is excluded because each method invocation necessarily writes there.
 
 ```bash
 swamp model create @mgreten/packet-certifier packet-certifier
@@ -25,7 +25,6 @@ globalArguments:
   allowedIgnoredPaths:
     - .tool/package.json
   allowedIgnoredPathPrefixes:
-    - .swamp/
     - .tool/cache/
 ```
 
@@ -101,7 +100,7 @@ The model resolves and stores the base commit and object format during the pre-i
 
 Each file is limited to 10 MiB, aggregate inspected state to 50 MiB, Git output to 4 MiB, inventories to conservative fixed counts, and commands to 30 seconds. Disallowed ignored paths are reported before their contents are read. The published targets are Apple Silicon macOS and x86-64 Linux with Git 2.37+ and Deno; Windows is not currently supported or claimed.
 
-Ignored files require a separate policy because Git does not retain their previous content. The snapshot method hashes the complete ignored state before implementation. Certification hashes it twice afterward, requires both hashes to agree, compares them with the snapshot, and rejects ignored paths outside the configured policy. Allowed ignored trees are therefore permitted to exist but not silently mutate.
+Ignored files require a separate policy because Git does not retain their previous content. The snapshot method hashes the complete application-owned ignored state before implementation. Certification hashes it twice afterward, requires both hashes to agree, compares them with the snapshot, and rejects ignored paths outside the configured policy. Allowed ignored trees are therefore permitted to exist but not silently mutate. Files under `.swamp/` are outside this comparison because Swamp writes model outputs and evidence there during both methods; protect that operational directory with normal host permissions and Swamp's own data controls.
 
 ## Security Boundaries
 
@@ -109,6 +108,7 @@ Ignored files require a separate policy because Git does not retain their previo
 - Do not treat `passed: true` as a substitute for sandboxing, tests, code review, or human approval.
 - Record certification evidence immediately; later filesystem mutations are outside the report.
 - Keep `allowedIgnoredPaths` and `allowedIgnoredPathPrefixes` narrow. Broad prefixes increase the amount of runtime state that must be hashed and reviewed.
+- Treat `.swamp/` as trusted certification infrastructure. Its contents are excluded from worktree and ignored-state comparisons so that Swamp can persist method outputs.
 - Persisted reports omit command output to reduce the chance of retaining source code or secrets.
 - Evidence uses a 30-day lifetime with 20-item garbage collection. This is operational evidence, not permanent audit retention; export it into an appropriate audit system if longer retention is required.
 

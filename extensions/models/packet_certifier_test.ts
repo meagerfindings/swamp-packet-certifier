@@ -10,6 +10,7 @@ type Snapshot = {
   rootBinding: string;
   fileCount: number;
   stateHash: string;
+  ignoredScope?: "application-owned-v1";
   capturedAt: string;
 };
 
@@ -31,6 +32,7 @@ type Report = {
 type Harness = {
   store: Map<string, Record<string, unknown>>;
   context: {
+    repoDir?: string;
     globalArgs: {
       allowedIgnoredPaths: string[];
       allowedIgnoredPathPrefixes: string[];
@@ -105,6 +107,7 @@ async function snapshot(
   packetId = "packet-1",
   invocationId = "call-1",
 ): Promise<Snapshot> {
+  h.context.repoDir ??= cwd;
   let value: Snapshot | undefined;
   const originalWrite = h.context.writeResource;
   h.context.writeResource = async (spec, name, payload) => {
@@ -240,6 +243,118 @@ Deno.test("ID schema rejects lossy or ambiguous resource names", () => {
     }).success,
     false,
   );
+});
+
+Deno.test("method schemas accept Swamp-injected global arguments", () => {
+  const globalArgs = {
+    allowedIgnoredPaths: [],
+    allowedIgnoredPathPrefixes: [".swamp/"],
+  };
+
+  assertEquals(
+    model.methods.snapshotIgnoredState.arguments.safeParse({
+      cwd: "/tmp/repo",
+      packetId: "packet",
+      invocationId: "call",
+      ...globalArgs,
+    }).success,
+    true,
+  );
+  assertEquals(
+    model.methods.certify.arguments.safeParse({
+      cwd: "/tmp/repo",
+      packetId: "packet",
+      invocationId: "call",
+      allowedPaths: ["README.md"],
+      ...globalArgs,
+    }).success,
+    true,
+  );
+  assertEquals(
+    model.methods.snapshotIgnoredState.arguments.safeParse({
+      cwd: "/tmp/repo",
+      packetId: "packet",
+      invocationId: "call",
+      baseReff: "origin/main",
+      ...globalArgs,
+    }).success,
+    false,
+  );
+  assertEquals(
+    model.methods.certify.arguments.safeParse({
+      cwd: "/tmp/repo",
+      packetId: "packet",
+      invocationId: "call",
+      allowedPaths: ["README.md"],
+      cheks: [],
+      ...globalArgs,
+    }).success,
+    false,
+  );
+});
+
+Deno.test("excludes Swamp-owned runtime state from ignored-state protection", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, ".swamp/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore swamp runtime"]);
+    await Deno.mkdir(`${cwd}/.swamp`);
+    await Deno.writeTextFile(`${cwd}/.swamp/state`, "before\n");
+    const h = harness();
+    await snapshot(cwd, h);
+
+    await Deno.writeTextFile(`${cwd}/.swamp/state`, "after\n");
+    await Deno.writeTextFile(`${cwd}/.swamp/output`, "new\n");
+    const report = await certify(cwd, h, ["README.md"]);
+
+    assertEquals(report.passed, true);
+    assertEquals(report.ignoredPathViolations, []);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("does not exempt .swamp in a different target repository", async () => {
+  const cwd = await createRepo();
+  const contextRepo = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, ".swamp/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore app swamp directory"]);
+    await Deno.mkdir(`${cwd}/.swamp`);
+    await Deno.writeTextFile(`${cwd}/.swamp/state`, "application state\n");
+    const h = harness();
+    h.context.repoDir = contextRepo;
+
+    await assertRejects(
+      () => snapshot(cwd, h),
+      Error,
+      "ignored path is not permitted by policy: .swamp/state",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+    await Deno.remove(contextRepo, { recursive: true });
+  }
+});
+
+Deno.test("rejects legacy snapshots with incompatible ignored scope", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    const stored = [...h.store.values()].find((value) => value.capturedAt);
+    if (!stored) throw new Error("snapshot was not stored");
+    delete stored.ignoredScope;
+
+    await assertRejects(
+      () => certify(cwd, h, ["README.md"]),
+      Error,
+      "snapshot predates application-owned scope",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
 });
 
 Deno.test("detects ignored content and permission changes", async () => {

@@ -12,6 +12,7 @@ const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+const IGNORED_SCOPE = "application-owned-v1";
 
 const IdString = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 const ShortString = z.string().min(1).max(256);
@@ -27,6 +28,7 @@ const SnapshotBindingSchema = z.object({
   rootBinding: HashString,
   fileCount: Count.max(MAX_PATHS),
   stateHash: HashString,
+  ignoredScope: z.literal(IGNORED_SCOPE).optional(),
 }).strict();
 
 const IgnoredSnapshotSchema = SnapshotBindingSchema.extend({
@@ -194,6 +196,7 @@ async function command(
   label: string,
   args: string[],
   acceptedCodes: number[] = [0],
+  literalPathspecs = true,
 ): Promise<Deno.CommandOutput> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), COMMAND_TIMEOUT_MS);
@@ -223,7 +226,7 @@ async function command(
         GIT_EXTERNAL_DIFF: "",
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: "/dev/null",
-        GIT_LITERAL_PATHSPECS: "1",
+        ...(literalPathspecs ? { GIT_LITERAL_PATHSPECS: "1" } : {}),
         GIT_NO_REPLACE_OBJECTS: "1",
         GIT_NO_LAZY_FETCH: "1",
       },
@@ -345,14 +348,77 @@ async function list(
   return decodeZ((await command(cwd, label, args)).stdout);
 }
 
-async function listIgnoredPaths(cwd: string): Promise<string[]> {
+async function topLevelPathspecs(
+  cwd: string,
+  excludeRuntimeSwamp: boolean,
+): Promise<string[]> {
+  const paths: string[] = [];
+  for await (const entry of Deno.readDir(cwd)) {
+    if (
+      entry.name === ".git" ||
+      (excludeRuntimeSwamp && entry.name === ".swamp" && entry.isDirectory)
+    ) continue;
+    validateRepoPath(entry.name);
+    paths.push(entry.name);
+    if (paths.length > MAX_PATHS) {
+      throw new Error("top-level inventory exceeds path limit");
+    }
+  }
+  return paths;
+}
+
+async function listIgnoredPaths(
+  cwd: string,
+  excludeRuntimeSwamp: boolean,
+): Promise<string[]> {
+  const pathspecs = await topLevelPathspecs(cwd, excludeRuntimeSwamp);
+  if (!pathspecs.length) return [];
   return await list(cwd, [
     "ls-files",
     "--others",
     "--ignored",
     "--exclude-standard",
     "-z",
+    "--",
+    ...pathspecs,
   ], "git ls-files ignored");
+}
+
+async function excludesRuntimeSwamp(
+  cwd: string,
+  context: ModelContext,
+): Promise<boolean> {
+  if (!context.repoDir || await canonicalRepoRoot(context.repoDir) !== cwd) {
+    return false;
+  }
+  try {
+    const stat = await Deno.lstat(`${cwd}/.swamp`);
+    if (!stat.isDirectory || stat.isSymlink) {
+      throw new Error("repository .swamp path must be a regular directory");
+    }
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return false;
+    throw error;
+  }
+  if (
+    (await list(cwd, ["ls-files", "-z", "--", ".swamp"], "git ls-files .swamp"))
+      .length
+  ) {
+    throw new Error(
+      "tracked .swamp paths cannot be certification infrastructure",
+    );
+  }
+  const ignored = await command(
+    cwd,
+    "git check-ignore .swamp",
+    ["check-ignore", "-q", "--", ".swamp"],
+    [0, 1],
+    false,
+  );
+  if (ignored.code !== 0) {
+    throw new Error("repository .swamp directory must be ignored by Git");
+  }
+  return true;
 }
 
 function ignoredAllowed(
@@ -394,6 +460,7 @@ async function ignoredSnapshot(
     rootBinding: await rootBinding(cwd),
     fileCount: paths.length,
     stateHash: await canonicalHash(parts),
+    ignoredScope: IGNORED_SCOPE,
   };
 }
 
@@ -494,7 +561,10 @@ async function baseTree(cwd: string, base: string): Promise<BaseEntry[]> {
   });
 }
 
-async function finalTree(cwd: string): Promise<FinalEntry[]> {
+async function finalTree(
+  cwd: string,
+  excludeRuntimeSwamp: boolean,
+): Promise<FinalEntry[]> {
   const pending = [cwd];
   let count = 0;
   const files: FinalEntry[] = [];
@@ -502,6 +572,10 @@ async function finalTree(cwd: string): Promise<FinalEntry[]> {
     const directory = pending.pop()!;
     for await (const entry of Deno.readDir(directory)) {
       if (directory === cwd && entry.name === ".git") continue;
+      if (
+        excludeRuntimeSwamp && directory === cwd && entry.name === ".swamp" &&
+        entry.isDirectory
+      ) continue;
       count++;
       if (count > MAX_PATHS * 10) {
         throw new Error("filesystem inventory exceeds entry limit");
@@ -685,7 +759,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.24.1",
+  version: "2026.07.24.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     ignoredSnapshot: {
@@ -706,6 +780,7 @@ export const model = {
       description:
         "Capture ignored state before an attended implementation invocation.",
       arguments: z.object({
+        ...GlobalArgsSchema.shape,
         cwd: z.string().min(1).max(4_096),
         packetId: IdString,
         invocationId: IdString,
@@ -726,9 +801,10 @@ export const model = {
         }
         await rejectExecutableFilters(cwd);
         await rejectLazyFetchConfiguration(cwd);
+        const excludeRuntimeSwamp = await excludesRuntimeSwamp(cwd, context);
         const resolvedBaseSha = await resolveBase(cwd, args.baseRef as string);
         const format = await objectFormat(cwd);
-        const paths = await listIgnoredPaths(cwd);
+        const paths = await listIgnoredPaths(cwd, excludeRuntimeSwamp);
         const policy = ignoredPolicy(context);
         const violation = paths.find((path) =>
           !ignoredAllowed(path, policy.exact, policy.prefixes)
@@ -764,6 +840,7 @@ export const model = {
       description:
         "Certify an attended invocation's unstaged Git worktree changes.",
       arguments: z.object({
+        ...GlobalArgsSchema.shape,
         cwd: z.string().min(1).max(4_096),
         packetId: IdString,
         invocationId: IdString,
@@ -797,11 +874,17 @@ export const model = {
           throw new Error("pre-invocation ignored-state snapshot not found");
         }
         const parsedSnapshot = IgnoredSnapshotSchema.parse(storedSnapshot);
+        if (!parsedSnapshot.ignoredScope) {
+          throw new Error(
+            "ignored-state snapshot predates application-owned scope; create a new invocation snapshot",
+          );
+        }
         const { capturedAt: _capturedAt, ...expected } = parsedSnapshot;
         const allowedPaths = args.allowedPaths as string[];
         for (const path of allowedPaths) validateRepoPath(path);
         await rejectExecutableFilters(cwd);
         await rejectLazyFetchConfiguration(cwd);
+        const excludeRuntimeSwamp = await excludesRuntimeSwamp(cwd, context);
         const base = expected.resolvedBaseSha;
         await command(cwd, "git fsck base", [
           "fsck",
@@ -813,8 +896,8 @@ export const model = {
         await preflightIndex(cwd);
         await requireUnstagedOnly(cwd);
         const baseEntries = await baseTree(cwd, base);
-        const finalEntries = await finalTree(cwd);
-        const ignoredPaths = await listIgnoredPaths(cwd);
+        const finalEntries = await finalTree(cwd, excludeRuntimeSwamp);
+        const ignoredPaths = await listIgnoredPaths(cwd, excludeRuntimeSwamp);
         const changes = await collectChanges(
           cwd,
           baseEntries,
