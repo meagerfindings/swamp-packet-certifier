@@ -314,7 +314,7 @@ async function rootBinding(cwd: string): Promise<string> {
   return await canonicalHash([new TextEncoder().encode(cwd)]);
 }
 
-function decodeZ(data: Uint8Array): string[] {
+function splitZ(data: Uint8Array): string[] {
   const text = new TextDecoder("utf-8", { fatal: true }).decode(data);
   const fields = text.split("\0");
   if (fields.pop() !== "") {
@@ -323,6 +323,11 @@ function decodeZ(data: Uint8Array): string[] {
   if (fields.length > MAX_PATHS) {
     throw new Error("inventory exceeds path limit");
   }
+  return fields;
+}
+
+function decodeZ(data: Uint8Array): string[] {
+  const fields = splitZ(data);
   for (const path of fields) validateRepoPath(path);
   return fields;
 }
@@ -355,6 +360,18 @@ async function list(
   );
 }
 
+/** Enumerate paths without validating them, for callers that filter first. */
+async function listRaw(
+  cwd: string,
+  args: string[],
+  label: string,
+  literalPathspecs = true,
+): Promise<string[]> {
+  return splitZ(
+    (await command(cwd, label, args, [0], literalPathspecs)).stdout,
+  );
+}
+
 async function topLevelPathspecs(
   cwd: string,
   excludeRuntimeSwamp: boolean,
@@ -381,7 +398,14 @@ async function listIgnoredPaths(
 ): Promise<string[]> {
   const pathspecs = await topLevelPathspecs(cwd, excludeRuntimeSwamp);
   if (!pathspecs.length) return [];
-  return await list(
+  // Exclusion is applied twice, deliberately. The :(exclude) pathspec keeps a
+  // large excluded tree from being enumerated at all, so it cannot exhaust the
+  // path limit. It is not sufficient on its own: git reports an ignored
+  // directory it will not descend into — notably a nested repository — as one
+  // opaque entry with a trailing slash, and no pathspec excluding a path
+  // inside that directory matches it. The in-code filter below covers that
+  // case, so both layers are required.
+  const raw = await listRaw(
     cwd,
     [
       "ls-files",
@@ -398,6 +422,19 @@ async function listIgnoredPaths(
     "git ls-files ignored",
     false,
   );
+  const paths: string[] = [];
+  for (const path of raw) {
+    if (excludedPrefixes.some((prefix) => path.startsWith(prefix))) continue;
+    // A trailing slash marks a directory git declined to enumerate. Only an
+    // excluded prefix may legitimately hide such a tree; anything else is
+    // unbounded state this model must not silently ignore.
+    if (path.endsWith("/")) {
+      throw new Error(`refusing unenumerable ignored directory: ${path}`);
+    }
+    validateRepoPath(path);
+    paths.push(path);
+  }
+  return paths;
 }
 
 async function excludesRuntimeSwamp(

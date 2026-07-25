@@ -477,6 +477,31 @@ Deno.test("explicitly excludes a large ignored runtime tree while hashing protec
   }
 });
 
+Deno.test("prunes excluded ignored prefixes containing nested repositories", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, ".worktrees/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore worktrees"]);
+    // Agent worktrees are full nested checkouts. git ls-files reports each
+    // one as a single opaque directory entry with a trailing slash, and
+    // pathspec exclusion cannot match inside it.
+    for (const name of ["agent-a", "agent-b"]) {
+      const nested = `${cwd}/.worktrees/${name}`;
+      await Deno.mkdir(nested, { recursive: true });
+      await gitOutput(nested, ["init"]);
+      await Deno.writeTextFile(`${nested}/nested.txt`, "nested\n");
+    }
+    const h = harness({ excludedIgnoredPathPrefixes: [".worktrees/"] });
+
+    const before = await snapshot(cwd, h);
+    assertEquals(before.fileCount, 0);
+    assertEquals((await certify(cwd, h, ["README.md"])).passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 Deno.test("binds excluded ignored prefixes to the invocation snapshot", async () => {
   const cwd = await createRepo();
   try {
