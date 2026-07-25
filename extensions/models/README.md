@@ -49,10 +49,22 @@ globalArguments:
 reproducible runtime trees that cannot fit within the bounded inventory.
 Excluded prefixes are pruned before ignored-file and final-tree enumeration, so
 their contents are neither inspected nor hashed. Each prefix must identify a
-Git-ignored, untracked directory with no symlink in its path. The exact
-exclusion policy is bound into the pre-invocation snapshot and recorded in
-certification evidence; changing it between snapshot and certification fails
-closed. Prefer `allowedIgnoredPathPrefixes` whenever the tree fits the limits.
+Git-ignored, untracked directory with no symlink in its path, spelled exactly as
+it appears on disk. Because pruning compares bytes while the filesystem may
+resolve case and Unicode form, a prefix that differs from the real directory's
+name is rejected rather than silently excluding nothing. Prefixes must not
+overlap one another. The exact exclusion policy is bound into the pre-invocation
+snapshot and recorded in certification evidence; changing it between snapshot
+and certification fails closed. Prefer `allowedIgnoredPathPrefixes` whenever the
+tree fits the limits.
+
+An excluded prefix is the only supported way to carry an ignored tree Git
+refuses to enumerate, such as a directory holding nested repositories or agent
+worktrees. Git reports each of those as one opaque entry, so their contents can
+be pruned but never inspected. Those entries do not count toward the packet path
+limit, so an excluded tree may hold more nested repositories than a packet may
+change files. An unenumerable ignored directory outside every excluded prefix is
+rejected rather than skipped.
 
 ## Usage
 
@@ -98,6 +110,13 @@ swamp data list packet-certifier
 | `allowedIgnoredPaths`         | `string[]` | `[]`    | Exact ignored files permitted to exist. Sensitive ignored files not listed here fail certification.                                                       |
 | `allowedIgnoredPathPrefixes`  | `string[]` | `[]`    | Ignored path prefixes permitted to exist. Their contents are hashed before and after implementation.                                                      |
 | `excludedIgnoredPathPrefixes` | `string[]` | `[]`    | Large ignored runtime prefixes intentionally outside content inspection and hashing. Exclusions are validated, snapshot-bound, and disclosed in evidence. |
+
+The ignored-state policy is instance-scoped by design, so that no caller can
+widen what a packet may touch. Swamp injects a model's global arguments into
+every method call, so these three names also appear in each method's inputs and
+are accepted there; values passed per call are ignored in favour of the model
+definition. Certify a repository with a different runtime layout by creating a
+second model instance rather than by overriding a policy at the call site.
 
 ## Method: `snapshotIgnoredState`
 

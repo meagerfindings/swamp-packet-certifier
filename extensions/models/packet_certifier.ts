@@ -314,13 +314,18 @@ async function rootBinding(cwd: string): Promise<string> {
   return await canonicalHash([new TextEncoder().encode(cwd)]);
 }
 
-function splitZ(data: Uint8Array): string[] {
+/**
+ * Split NUL-delimited Git output. `limit` bounds the entries returned; callers
+ * that discard entries before retaining them pass the wider repository ceiling
+ * and enforce the packet limit on what survives.
+ */
+function splitZ(data: Uint8Array, limit: number = MAX_PATHS): string[] {
   const text = new TextDecoder("utf-8", { fatal: true }).decode(data);
   const fields = text.split("\0");
   if (fields.pop() !== "") {
     throw new Error("malformed NUL-delimited Git output");
   }
-  if (fields.length > MAX_PATHS) {
+  if (fields.length > limit) {
     throw new Error("inventory exceeds path limit");
   }
   return fields;
@@ -360,15 +365,21 @@ async function list(
   );
 }
 
-/** Enumerate paths without validating them, for callers that filter first. */
+/**
+ * Enumerate paths without validating them, for callers that discard entries
+ * before retaining them. Such a caller must apply `validateRepoPath` to every
+ * path it keeps and bound the retained set itself.
+ */
 async function listRaw(
   cwd: string,
   args: string[],
   label: string,
-  literalPathspecs = true,
+  literalPathspecs: boolean,
+  limit: number,
 ): Promise<string[]> {
   return splitZ(
     (await command(cwd, label, args, [0], literalPathspecs)).stdout,
+    limit,
   );
 }
 
@@ -398,13 +409,17 @@ async function listIgnoredPaths(
 ): Promise<string[]> {
   const pathspecs = await topLevelPathspecs(cwd, excludeRuntimeSwamp);
   if (!pathspecs.length) return [];
-  // Exclusion is applied twice, deliberately. The :(exclude) pathspec keeps a
-  // large excluded tree from being enumerated at all, so it cannot exhaust the
-  // path limit. It is not sufficient on its own: git reports an ignored
-  // directory it will not descend into — notably a nested repository — as one
-  // opaque entry with a trailing slash, and no pathspec excluding a path
-  // inside that directory matches it. The in-code filter below covers that
-  // case, so both layers are required.
+  // Exclusion is applied twice, deliberately. The :(exclude) pathspec prunes
+  // the common case cheaply, inside Git. It is not sufficient on its own: Git
+  // reports an ignored directory it will not descend into — notably a nested
+  // repository — as one opaque entry with a trailing slash, and no pathspec
+  // excluding a path inside that directory matches it. Those entries reach the
+  // filter below, so both layers are required.
+  //
+  // The raw list is therefore bounded by the repository ceiling rather than the
+  // packet limit: one entry per unenumerable directory can survive the
+  // pathspec, and capping the raw list would fail a legitimately excluded tree
+  // of many nested repositories. MAX_PATHS is enforced on the retained set.
   const raw = await listRaw(
     cwd,
     [
@@ -421,11 +436,12 @@ async function listIgnoredPaths(
     ],
     "git ls-files ignored",
     false,
+    MAX_REPOSITORY_PATHS,
   );
   const paths: string[] = [];
   for (const path of raw) {
     if (excludedPrefixes.some((prefix) => path.startsWith(prefix))) continue;
-    // A trailing slash marks a directory git declined to enumerate. Only an
+    // A trailing slash marks a directory Git declined to enumerate. Only an
     // excluded prefix may legitimately hide such a tree; anything else is
     // unbounded state this model must not silently ignore.
     if (path.endsWith("/")) {
@@ -433,6 +449,9 @@ async function listIgnoredPaths(
     }
     validateRepoPath(path);
     paths.push(path);
+    if (paths.length > MAX_PATHS) {
+      throw new Error("inventory exceeds path limit");
+    }
   }
   return paths;
 }
@@ -500,6 +519,24 @@ async function validateExcludedIgnoredPrefixes(
           throw new Error(`excluded ignored prefix does not exist: ${root}`);
         }
         throw error;
+      }
+      // lstat resolves case-insensitively on APFS/HFS+ and normalizes Unicode,
+      // so a prefix that differs from the real directory's bytes would pass
+      // every check above and then silently exclude nothing. Pruning compares
+      // bytes, so require the declared spelling to be the on-disk spelling.
+      const parent = segments.slice(0, i - 1).join("/");
+      const name = segments[i - 1];
+      let found = false;
+      for await (const entry of Deno.readDir(`${cwd}/${parent}`)) {
+        if (entry.name === name) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        throw new Error(
+          `excluded ignored prefix does not match the on-disk name: ${ancestor}`,
+        );
       }
     }
     if (
@@ -865,6 +902,15 @@ async function worktreeHash(
   return await canonicalHash(parts);
 }
 
+/**
+ * Resolve the ignored-state policy from the model definition.
+ *
+ * The policy is deliberately instance-scoped, never per-invocation: a caller
+ * must not be able to widen what a packet may touch. The three policy fields
+ * appear in both method argument schemas only because Swamp injects a model's
+ * global arguments into every method call and those schemas are strict; values
+ * passed per call are accepted and ignored in favour of the definition.
+ */
 function ignoredPolicy(
   context: ModelContext,
 ): { exact: Set<string>; prefixes: string[]; excludedPrefixes: string[] } {
@@ -884,6 +930,17 @@ function ignoredPolicy(
   }
   if (new Set(excludedPrefixes).size !== excludedPrefixes.length) {
     throw new Error("excluded ignored path prefixes must be unique");
+  }
+  for (const prefix of excludedPrefixes) {
+    if (
+      excludedPrefixes.some((other) =>
+        other !== prefix && prefix.startsWith(other)
+      )
+    ) {
+      throw new Error(
+        `excluded ignored path prefix is already covered: ${prefix}`,
+      );
+    }
   }
   for (const excluded of excludedPrefixes) {
     if (
@@ -905,7 +962,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.24.5",
+  version: "2026.07.25.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -921,6 +978,10 @@ export const model = {
   }, {
     toVersion: "2026.07.24.5",
     description: "Normalize tracked permissions to Git file modes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.07.25.1",
+    description: "Prune excluded ignored trees holding nested repositories",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {

@@ -502,6 +502,121 @@ Deno.test("prunes excluded ignored prefixes containing nested repositories", asy
   }
 });
 
+Deno.test("excludes more nested repositories than the packet path limit", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, ".worktrees/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore worktrees"]);
+    // Each nested repository survives the :(exclude) pathspec as its own
+    // opaque entry, so more than MAX_PATHS of them must still be prunable.
+    // These have to be real repositories: Git reports neither an empty
+    // directory nor a hand-made .git, so nothing would be pruned otherwise.
+    await Deno.mkdir(`${cwd}/.worktrees`);
+    for (let i = 0; i <= 1_000; i++) {
+      await gitOutput(cwd, ["init", "-q", `.worktrees/agent-${i}`]);
+    }
+    const h = harness({ excludedIgnoredPathPrefixes: [".worktrees/"] });
+
+    const before = await snapshot(cwd, h);
+    assertEquals(before.fileCount, 0);
+    assertEquals((await certify(cwd, h, ["README.md"])).passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects an unenumerable ignored directory outside every exclusion", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "vendored/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore vendored"]);
+    const nested = `${cwd}/vendored/library`;
+    await Deno.mkdir(nested, { recursive: true });
+    await gitOutput(nested, ["init"]);
+
+    await assertRejects(
+      () => snapshot(cwd, harness()),
+      Error,
+      "refusing unenumerable ignored directory",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("definition policy wins over policy passed per call", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "secret.env\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore secret"]);
+    await Deno.writeTextFile(`${cwd}/secret.env`, "TOKEN=1\n");
+    const h = harness();
+
+    // A caller must not be able to widen the policy at the call site.
+    await assertRejects(
+      () =>
+        model.methods.snapshotIgnoredState.execute({
+          cwd,
+          packetId: "packet-1",
+          invocationId: "call-1",
+          baseRef: "HEAD",
+          allowedIgnoredPaths: ["secret.env"],
+          allowedIgnoredPathPrefixes: [],
+          excludedIgnoredPathPrefixes: [],
+        }, h.context),
+      Error,
+      "ignored path is not permitted by policy: secret.env",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects an excluded prefix that is not the on-disk spelling", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "Cache/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore cache"]);
+    await Deno.mkdir(`${cwd}/Cache`);
+    await Deno.writeTextFile(`${cwd}/Cache/generated`, "generated\n");
+
+    // A case-insensitive filesystem resolves "cache" to "Cache", so every
+    // stat-based check would pass while byte-wise pruning matched nothing.
+    await assertRejects(
+      () => snapshot(cwd, harness({ excludedIgnoredPathPrefixes: ["cache/"] })),
+      Error,
+      "excluded ignored prefix does not match the on-disk name",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("does not exclude a sibling sharing an excluded prefix name", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "run/\nrun-evil/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore runtime"]);
+    await Deno.mkdir(`${cwd}/run`);
+    await Deno.writeTextFile(`${cwd}/run/generated`, "generated\n");
+    await Deno.mkdir(`${cwd}/run-evil`);
+    await Deno.writeTextFile(`${cwd}/run-evil/smuggled`, "smuggled\n");
+
+    await assertRejects(
+      () => snapshot(cwd, harness({ excludedIgnoredPathPrefixes: ["run/"] })),
+      Error,
+      "ignored path is not permitted by policy: run-evil/smuggled",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 Deno.test("binds excluded ignored prefixes to the invocation snapshot", async () => {
   const cwd = await createRepo();
   try {
