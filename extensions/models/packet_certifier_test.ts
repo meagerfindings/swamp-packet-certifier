@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { model } from "./packet_certifier.ts";
 
 type Snapshot = {
-  hashVersion: "packet-certifier-v6";
+  hashVersion: "packet-certifier-v7";
   packetId: string;
   invocationId: string;
   resolvedBaseSha: string;
@@ -25,6 +25,7 @@ type Report = {
     removed: number;
     binary: boolean;
   }>;
+  pathViolations: string[];
   ignoredPathViolations: string[];
   budgetViolations: { maxChangedLines: boolean; binaryFiles: string[] };
   checkResults: Array<{ passed: boolean }>;
@@ -952,7 +953,7 @@ Deno.test("rejects existing gitlinks and nested repositories", async () => {
     await assertRejects(
       () => certify(gitlink, h, ["vendor"]),
       Error,
-      "indexed symlink or gitlink",
+      "indexed gitlink",
     );
   } finally {
     await Deno.remove(gitlink, { recursive: true });
@@ -1070,6 +1071,137 @@ Deno.test({
   },
 });
 
+Deno.test("detects a tracked edit that preserves the base byte length", async () => {
+  const cwd = await createRepo("aaaaaa\n");
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    // Same length and same mode, so neither the base size nor the base mode
+    // distinguishes this file from an untouched one.
+    await Deno.writeTextFile(`${cwd}/README.md`, "bbbbbb\n");
+    assertEquals(
+      (await Deno.lstat(`${cwd}/README.md`)).size,
+      "aaaaaa\n".length,
+    );
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("detects a same-length edit Git itself declines to report", async () => {
+  const cwd = await createRepo("aaaaaa\n");
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    // --assume-unchanged makes Git report a clean worktree, so the diff union
+    // contributes nothing. With size and mode also unchanged, only re-deriving
+    // the blob object ID from worktree bytes can catch this.
+    await gitOutput(cwd, ["update-index", "--assume-unchanged", "README.md"]);
+    await Deno.writeTextFile(`${cwd}/README.md`, "bbbbbb\n");
+    assertEquals(await gitOutput(cwd, ["diff", "--name-only", "HEAD"]), "");
+
+    await assertRejects(
+      () => certify(cwd, h, ["README.md"]),
+      Error,
+      "differs from base without a detectable change",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("detects a mode-only change on a tracked file", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.chmod(`${cwd}/README.md`, 0o755);
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("detects a deleted tracked file", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.remove(`${cwd}/README.md`);
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+    assertEquals(report.changedFiles[0].removed, 1);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("detects an untracked added file", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/added.txt`, "new file\n");
+
+    const report = await certify(cwd, h, ["added.txt"]);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "added.txt",
+    ]);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("certifies a repository whose tracked content exceeds the aggregate byte limit", async () => {
+  const cwd = await createRepo();
+  try {
+    // 64 MiB of tracked content against a 50 MiB MAX_TOTAL_BYTES: reading every
+    // tracked file would fail closed, so passing proves only candidates were read.
+    await Deno.mkdir(`${cwd}/bulk`);
+    const megabyte = new Uint8Array(1024 * 1024).fill(97);
+    for (let i = 0; i < 64; i++) {
+      await Deno.writeFile(`${cwd}/bulk/${i}.dat`, megabyte);
+    }
+    await gitOutput(cwd, ["add", "bulk"]);
+    await gitOutput(cwd, [
+      "-c",
+      "user.name=Packet Certifier Test",
+      "-c",
+      "user.email=packet-certifier@example.test",
+      "commit",
+      "-m",
+      "bulk tracked content",
+    ]);
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.passed, true);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 async function exists(path: string): Promise<boolean> {
   try {
     await Deno.stat(path);
@@ -1079,3 +1211,223 @@ async function exists(path: string): Promise<boolean> {
     throw error;
   }
 }
+
+/** Commit a tracked symlink so it exists in the base tree as mode 120000. */
+async function commitSymlink(
+  cwd: string,
+  target: string,
+  name: string,
+): Promise<void> {
+  await Deno.symlink(target, `${cwd}/${name}`);
+  await gitOutput(cwd, ["add", name]);
+  await gitOutput(cwd, [
+    "-c",
+    "user.name=Packet Certifier Test",
+    "-c",
+    "user.email=packet-certifier@example.test",
+    "commit",
+    "-m",
+    `track symlink ${name}`,
+  ]);
+  const mode = await gitOutput(cwd, ["ls-files", "--stage", "--", name]);
+  if (!mode.startsWith("120000")) {
+    throw new Error(`expected a tracked symlink, got: ${mode}`);
+  }
+}
+
+Deno.test({
+  name: "certifies an unchanged tracked symlink",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const cwd = await createRepo();
+    try {
+      await commitSymlink(cwd, "README.md", "link.md");
+      const h = harness();
+      await snapshot(cwd, h);
+      await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+
+      // The symlink is untouched, so it must not appear at all: a repository
+      // that merely contains tracked symlinks stays certifiable.
+      const report = await certify(cwd, h, ["README.md"]);
+      assertEquals(report.changedFiles.map((change) => change.path), [
+        "README.md",
+      ]);
+      assertEquals(report.passed, true);
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "detects a retargeted tracked symlink",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const cwd = await createRepo();
+    try {
+      await Deno.writeTextFile(`${cwd}/other.txt`, "other\n");
+      await gitOutput(cwd, ["add", "other.txt"]);
+      await gitOutput(cwd, [
+        "-c",
+        "user.name=Packet Certifier Test",
+        "-c",
+        "user.email=packet-certifier@example.test",
+        "commit",
+        "-m",
+        "add other",
+      ]);
+      await commitSymlink(cwd, "README.md", "link.md");
+      const h = harness();
+      await snapshot(cwd, h);
+      // Silence Git so the diff union contributes nothing, and retarget between
+      // two names of identical length so the stat size matches the base blob
+      // size too. Only comparing the target bytes themselves can catch this.
+      await gitOutput(cwd, ["update-index", "--assume-unchanged", "link.md"]);
+      await Deno.remove(`${cwd}/link.md`);
+      await Deno.symlink("other.txt", `${cwd}/link.md`);
+      assertEquals("README.md".length, "other.txt".length);
+      assertEquals(await gitOutput(cwd, ["diff", "--name-only", "HEAD"]), "");
+
+      const report = await certify(cwd, h, ["README.md"]);
+      assertEquals(report.changedFiles.map((change) => change.path), [
+        "link.md",
+      ]);
+      assertEquals(report.pathViolations, ["link.md"]);
+      assertEquals(report.passed, false);
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "detects a newly added symlink",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const cwd = await createRepo();
+    try {
+      const h = harness();
+      await snapshot(cwd, h);
+      await Deno.symlink("README.md", `${cwd}/added-link`);
+
+      const report = await certify(cwd, h, ["README.md"]);
+      assertEquals(report.changedFiles.map((change) => change.path), [
+        "added-link",
+      ]);
+      assertEquals(report.pathViolations, ["added-link"]);
+      assertEquals(report.passed, false);
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "reports a symlink escaping the worktree without reading through it",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const cwd = await createRepo();
+    const outside = await Deno.makeTempDir();
+    try {
+      // 40 lines of content that must never be attributed to the symlink, and a
+      // directory the walk must never descend into.
+      const secret = `${outside}/secret.txt`;
+      await Deno.writeTextFile(secret, "secret\n".repeat(40));
+      await Deno.mkdir(`${outside}/tree`);
+      await Deno.writeTextFile(`${outside}/tree/inside.txt`, "inside\n");
+      const h = harness();
+      await snapshot(cwd, h);
+      await Deno.symlink(secret, `${cwd}/escape-file`);
+      await Deno.symlink(`${outside}/tree`, `${cwd}/escape-dir`);
+
+      const report = await certify(cwd, h, ["README.md"], {
+        maxChangedFiles: 5,
+      });
+      const paths = report.changedFiles.map((change) => change.path).toSorted();
+      assertEquals(paths, ["escape-dir", "escape-file"]);
+      // One added line each: the target string. Reading through the symlink
+      // would report the 40 lines behind it instead.
+      for (const change of report.changedFiles) {
+        assertEquals(change.added, 1, change.path);
+      }
+      // Descending the symlinked directory would surface this path.
+      assertEquals(
+        paths.some((path) => path.includes("inside.txt")),
+        false,
+      );
+      assertEquals(report.passed, false);
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+      await Deno.remove(outside, { recursive: true });
+    }
+  },
+});
+
+Deno.test("certifies a repository exceeding the former repository ceiling", async () => {
+  const cwd = await createRepo();
+  try {
+    // The old MAX_REPOSITORY_PATHS was 10,000, and it bounded the index, the
+    // base tree, and the filesystem walk. Commit more than that so every one of
+    // those inventories is over the retired ceiling.
+    await Deno.mkdir(`${cwd}/bulk`);
+    for (let i = 0; i < 10_200; i++) {
+      await Deno.writeTextFile(`${cwd}/bulk/${i}.txt`, "bulk\n");
+    }
+    await gitOutput(cwd, ["add", "bulk"]);
+    await gitOutput(cwd, [
+      "-c",
+      "user.name=Packet Certifier Test",
+      "-c",
+      "user.email=packet-certifier@example.test",
+      "commit",
+      "-m",
+      "bulk tracked paths",
+    ]);
+    assertEquals(
+      (await gitOutput(cwd, ["ls-files"])).split("\n").length > 10_000,
+      true,
+    );
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("detects a deleted empty tracked file", async () => {
+  const cwd = await createRepo();
+  try {
+    // An empty base blob deleted from the worktree presents empty base bytes and
+    // empty final bytes, so a byte-equality shortcut would silently clear it.
+    await Deno.writeTextFile(`${cwd}/empty.txt`, "");
+    await gitOutput(cwd, ["add", "empty.txt"]);
+    await gitOutput(cwd, [
+      "-c",
+      "user.name=Packet Certifier Test",
+      "-c",
+      "user.email=packet-certifier@example.test",
+      "commit",
+      "-m",
+      "add empty file",
+    ]);
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.remove(`${cwd}/empty.txt`);
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "empty.txt",
+    ]);
+    assertEquals(report.pathViolations, ["empty.txt"]);
+    assertEquals(report.passed, false);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});

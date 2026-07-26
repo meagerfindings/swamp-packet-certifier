@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/packet-certifier"
-version: "2026.07.25.1"
+version: "2026.07.25.3"
 description: >
   Certify that an agent implementation packet changed only approved Git paths,
   stayed within file and line budgets, and preserved ignored runtime state.

@@ -3,11 +3,11 @@
 `@mgreten/packet-certifier` creates durable, structured evidence that a bounded
 implementation packet changed only approved files in a Git worktree. It resolves
 and records the base commit, handles tracked and untracked filenames safely,
-rejects symlink escapes and binary changes, enforces file and line budgets,
-protects ignored runtime trees with before/after hashes, and can evaluate a
-deterministic `git diff --check`-compatible policy internally without persisting
-source text. It is designed for attended agent workflows that need stronger
-evidence than a process exit code or an agent's self-report.
+rejects symlink escapes and binary changes, tracks symlink retargeting, enforces
+file and line budgets, protects ignored runtime trees with before/after hashes,
+and can evaluate a deterministic `git diff --check`-compatible policy internally
+without persisting source text. It is designed for attended agent workflows that
+need stronger evidence than a process exit code or an agent's self-report.
 
 This extension is a certification boundary, not an OS sandbox or an atomic
 filesystem snapshot. Stop implementation processes and watchers before
@@ -161,25 +161,47 @@ output.
 
 The model resolves and stores the base commit and object format during the
 pre-invocation snapshot. During certification it verifies reachable objects with
-`git fsck`, enumerates the immutable base tree with Git plumbing, independently
-recomputes every base blob's Git object ID, walks final files directly with
-Deno, and compares bytes and permission modes without trusting Git's worktree
-diff, index flags, stat cache, attributes, or moving refs. Fatal UTF-8 decoding
-makes invalid UTF-8 paths fail closed. Hashes use the versioned
-`packet-certifier-v6` canonical encoding with an unsigned 64-bit length before
-every field. Text line accounting removes common prefix and suffix lines and
-conservatively counts the remaining changed region; separated edits may
-therefore be over-counted but never under-counted. The optional whitespace check
-is implemented internally over changed final files; its declaration retains
-`git diff --check` compatibility but does not execute that command. Git runs
-with a minimal environment and lazy fetching disabled; partial-clone/promisor
-configuration, replacement refs, and executable content filters are rejected,
-while fsmonitor/hooks/external diff/text conversion/global/system configuration
-are disabled. Symlinks, special files, nested repositories, gitlinks,
-unsupported base objects, unmerged entries, and staged state are rejected.
-Tracked file permissions are normalized to Git's executable-bit-only
-`100644`/`100755` model; ignored-file evidence continues to hash all POSIX
-permission bits.
+`git fsck`, enumerates the immutable base tree with Git plumbing, walks final
+files directly with Deno, and compares bytes and permission modes without
+trusting Git's worktree diff, index flags, stat cache, attributes, or moving
+refs. Fatal UTF-8 decoding makes invalid UTF-8 paths fail closed. Hashes use the
+versioned `packet-certifier-v7` canonical encoding with an unsigned 64-bit
+length before every field.
+
+Content comparison is confined to a candidate set so that a large repository can
+be certified without reading it. The base tree supplies each blob's
+authoritative size and mode, so a deletion, a resize, or a mode change is
+decided without opening a file; paths Git itself reports as modified are unioned
+in, but only to widen the set, never to clear a path, because the index and
+`.gitattributes` are writable by the invocation under certification. Candidates
+are read, verified against their base object ID, and compared byte for byte.
+Every remaining tracked path is proved identical by re-deriving its blob object
+ID with `git hash-object --no-filters`, which consults no index and no stat
+cache and cannot be fed substituted content through a clean filter; that closes
+the equal-size, equal-mode rewrite an `--assume-unchanged` entry would otherwise
+hide. The aggregate byte limit therefore bounds candidate content rather than
+the whole repository. Text line accounting removes common prefix and suffix
+lines and conservatively counts the remaining changed region; separated edits
+may therefore be over-counted but never under-counted. The optional whitespace
+check is implemented internally over changed final files; its declaration
+retains `git diff --check` compatibility but does not execute that command. Git
+runs with a minimal environment and lazy fetching disabled;
+partial-clone/promisor configuration, replacement refs, and executable content
+filters are rejected, while fsmonitor/hooks/external diff/text
+conversion/global/system configuration are disabled. Special files, nested
+repositories, gitlinks, unsupported base objects, unmerged entries, and staged
+state are rejected.
+
+A tracked symlink is compared rather than refused, because a repository that
+merely contains one is not an attack. A symlink's content is the target path
+read with `readLink`, so an unchanged symlink certifies while an added, removed,
+or retargeted one is reported as a change; nothing is ever read through the
+link, and a symlink is never descended into or hashed as file content. The entry
+kind is part of the hashed representation, so a regular file and a symlink whose
+bytes coincide cannot be conflated. Ignored-state protection continues to refuse
+symlinks outright. Tracked file permissions are normalized to Git's
+executable-bit-only `100644`/`100755` model; ignored-file evidence continues to
+hash all POSIX permission bits.
 
 Each file is limited to 10 MiB, aggregate inspected state to 50 MiB, Git output
 to 4 MiB, packet/ignored inventories to 1,000 paths, repository inventories to

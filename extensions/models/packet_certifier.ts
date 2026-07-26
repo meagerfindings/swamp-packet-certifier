@@ -5,10 +5,20 @@
  */
 import { z } from "npm:zod@4.4.3";
 
-const HASH_VERSION = "packet-certifier-v6";
+const HASH_VERSION = "packet-certifier-v7";
 const SHA256 = /^[0-9a-f]{64}$/;
+// The packet limit: how many files one approved packet may change, and how many
+// ignored files this model will hash. It is a policy ceiling on the size of a
+// unit of reviewable work, so it does not move when the repository grows.
 const MAX_PATHS = 1_000;
-const MAX_REPOSITORY_PATHS = 10_000;
+// The repository limit: how many paths may exist in the base tree, the index, or
+// the worktree. It bounds retained path strings and per-entry syscalls, not
+// content bytes — non-candidate content is never read into this process (it is
+// hashed inside Git by `verifyUnchanged`), and candidate content stays bounded
+// by MAX_FILE_BYTES and MAX_TOTAL_BYTES. At 100k paths of ~100 bytes each the
+// inventories cost single-digit MiB of strings, which real monoliths need: an
+// 18k-file Rails application already presents 22k filesystem entries.
+const MAX_REPOSITORY_PATHS = 100_000;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
@@ -128,6 +138,13 @@ type Change = {
   binary: boolean;
   untracked?: boolean;
 };
+/**
+ * What kind of thing occupies a path.
+ *
+ * Only these two kinds are certifiable. Everything else — FIFOs, sockets,
+ * devices, gitlinks — is refused, so this type cannot silently widen.
+ */
+type EntryKind = "file" | "symlink";
 
 function validateRepoPath(path: string): void {
   if (
@@ -201,11 +218,15 @@ async function command(
   args: string[],
   acceptedCodes: number[] = [0],
   literalPathspecs = true,
+  stdin?: Uint8Array,
 ): Promise<Deno.CommandOutput> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), COMMAND_TIMEOUT_MS);
   try {
-    const output = await new Deno.Command("git", {
+    if (stdin && stdin.length > MAX_COMMAND_BYTES) {
+      throw new Error(`${label} exceeded input limit`);
+    }
+    const process = new Deno.Command("git", {
       args: [
         "-c",
         "core.quotePath=false",
@@ -235,10 +256,29 @@ async function command(
         GIT_NO_LAZY_FETCH: "1",
       },
       clearEnv: true,
+      stdin: stdin ? "piped" : "null",
       stdout: "piped",
       stderr: "piped",
       signal: controller.signal,
-    }).output();
+    });
+    let output: Deno.CommandOutput;
+    if (stdin) {
+      const child = process.spawn();
+      const writer = child.stdin.getWriter();
+      // Git may exit before draining a large path list — a broken pipe here is
+      // not a certification failure, the exit code below is what decides.
+      const written = writer.write(stdin)
+        .then(() => writer.close())
+        .catch(() => {});
+      // The write must not be awaited before the output is collected. Git streams
+      // one line of output per input line, so on a large repository it blocks
+      // writing stdout long before it has drained stdin; awaiting the write first
+      // deadlocks both pipes until the abort timer fires. Collecting concurrently
+      // keeps stdout draining while stdin fills.
+      [output] = await Promise.all([child.output(), written]);
+    } else {
+      output = await process.output();
+    }
     if (
       output.stdout.length > MAX_COMMAND_BYTES ||
       output.stderr.length > MAX_COMMAND_BYTES
@@ -331,12 +371,6 @@ function splitZ(data: Uint8Array, limit: number = MAX_PATHS): string[] {
   return fields;
 }
 
-function decodeZ(data: Uint8Array): string[] {
-  const fields = splitZ(data);
-  for (const path of fields) validateRepoPath(path);
-  return fields;
-}
-
 async function inspectRegular(
   cwd: string,
   path: string,
@@ -354,15 +388,74 @@ async function inspectRegular(
   };
 }
 
-async function list(
+/**
+ * Read a symlink's target as bytes, without following it.
+ *
+ * `readLink` returns the stored target string and performs no traversal, so an
+ * absolute or `../`-bearing target is only ever compared as data. This is the
+ * sole way symlink state enters the model: `inspectRegular` still refuses
+ * symlinks, so no content is read *through* one, and nothing here resolves the
+ * target or touches whatever it points at. A target that escapes the worktree is
+ * therefore reportable without being reachable.
+ *
+ * The target is bounded because a symlink's `lstat` size is its target length,
+ * which every filesystem caps far below MAX_FILE_BYTES; the check is kept so
+ * this cannot become an unbounded read if that ever stops being true.
+ */
+async function readSymlinkTarget(
   cwd: string,
-  args: string[],
+  path: string,
+): Promise<Uint8Array> {
+  const stat = await Deno.lstat(`${cwd}/${path}`);
+  if (!stat.isSymlink) {
+    throw new Error(`expected a symlink: ${path}`);
+  }
+  if (stat.size > MAX_FILE_BYTES) {
+    throw new Error(`symlink target exceeds byte limit: ${path}`);
+  }
+  return new TextEncoder().encode(await Deno.readLink(`${cwd}/${path}`));
+}
+
+/**
+ * Inspect whichever certifiable kind occupies a path.
+ *
+ * Callers that hash or compare worktree state go through this so a regular file
+ * and a symlink are never handled by the same branch by accident. The returned
+ * `mode` is meaningful only for files: Git stores no permission bits for a
+ * symlink, so it is reported as 0 and excluded from comparison.
+ */
+async function inspectEntry(
+  cwd: string,
+  path: string,
+  kind: EntryKind,
+): Promise<{ bytes: Uint8Array; mode: number }> {
+  if (kind === "symlink") {
+    return { bytes: await readSymlinkTarget(cwd, path), mode: 0 };
+  }
+  return await inspectRegular(cwd, path);
+}
+
+/**
+ * Report whether any tracked path matches a pathspec.
+ *
+ * The question is existence, so the inventory is bounded by the repository
+ * ceiling rather than the packet limit. Using the packet limit here would turn a
+ * monolith that tracks more than MAX_PATHS files under the queried prefix into a
+ * misleading "inventory exceeds path limit" instead of the specific violation the
+ * caller is testing for — a scale property must not be reported as a policy one.
+ */
+async function tracksAnyPath(
+  cwd: string,
   label: string,
-  literalPathspecs = true,
-): Promise<string[]> {
-  return decodeZ(
-    (await command(cwd, label, args, [0], literalPathspecs)).stdout,
-  );
+  pathspec: string,
+): Promise<boolean> {
+  const output = await command(cwd, label, [
+    "ls-files",
+    "-z",
+    "--",
+    pathspec,
+  ]);
+  return splitZ(output.stdout, MAX_REPOSITORY_PATHS).length > 0;
 }
 
 /**
@@ -395,7 +488,11 @@ async function topLevelPathspecs(
     ) continue;
     validateRepoPath(entry.name);
     paths.push(entry.name);
-    if (paths.length > MAX_PATHS) {
+    // How many entries sit at a repository's root is a property of the repository,
+    // not of the packet under review, so this is bounded by the repository
+    // ceiling. These become pathspecs on one Git invocation, which the command
+    // input limit bounds independently.
+    if (paths.length > MAX_REPOSITORY_PATHS) {
       throw new Error("top-level inventory exceeds path limit");
     }
   }
@@ -472,10 +569,7 @@ async function excludesRuntimeSwamp(
     if (error instanceof Deno.errors.NotFound) return false;
     throw error;
   }
-  if (
-    (await list(cwd, ["ls-files", "-z", "--", ".swamp"], "git ls-files .swamp"))
-      .length
-  ) {
+  if (await tracksAnyPath(cwd, "git ls-files .swamp", ".swamp")) {
     throw new Error(
       "tracked .swamp paths cannot be certification infrastructure",
     );
@@ -540,11 +634,11 @@ async function validateExcludedIgnoredPrefixes(
       }
     }
     if (
-      (await list(
+      await tracksAnyPath(
         cwd,
-        ["ls-files", "-z", "--", root],
         "git ls-files excluded ignored prefix",
-      )).length
+        root,
+      )
     ) {
       throw new Error(
         `excluded ignored prefix contains tracked paths: ${root}`,
@@ -583,13 +677,19 @@ async function ignoredSnapshot(
   const parts: Uint8Array[] = [];
   let total = 0;
   for (const path of paths.toSorted()) {
-    const { bytes, mode } = await inspectRegular(cwd, path);
+    // An ignored path may be a symlink; its target is compared as data and never
+    // followed. The kind joins the frame for the same anti-collision reason as in
+    // worktreeHash, so retargeting an ignored symlink moves this digest.
+    const kind = await entryKind(`${cwd}/${path}`);
+    if (!kind) throw new Error(`ignored path vanished during capture: ${path}`);
+    const { bytes, mode } = await inspectEntry(cwd, path, kind);
     total += bytes.length;
     if (total > MAX_TOTAL_BYTES) {
       throw new Error("ignored state exceeds aggregate byte limit");
     }
     parts.push(
       new TextEncoder().encode(path),
+      new TextEncoder().encode(kind),
       new TextEncoder().encode(mode.toString(8)),
       bytes,
     );
@@ -655,19 +755,20 @@ async function preflightIndex(cwd: string): Promise<void> {
     if (match[3] !== "0") {
       throw new Error("unmerged index entries are not certifiable");
     }
-    if (match[1] === "120000" || match[1] === "160000") {
-      throw new Error(`refusing indexed symlink or gitlink: ${match[4]}`);
+    // A gitlink is a second repository's history, whose content this model
+    // cannot inventory at all, so it stays refused. An indexed symlink is not
+    // refused: a pre-existing tracked symlink is ordinary repository content,
+    // and `collectChanges` compares its target against the base rather than
+    // following it. `requireUnstagedOnly` still rejects a dirty index, so the
+    // packet cannot have staged a symlink change past this point.
+    if (match[1] === "160000") {
+      throw new Error(`refusing indexed gitlink: ${match[4]}`);
     }
-  }
-}
-
-async function exists(path: string): Promise<boolean> {
-  try {
-    await Deno.lstat(path);
-    return true;
-  } catch (error) {
-    if (error instanceof Deno.errors.NotFound) return false;
-    throw error;
+    if (
+      match[1] !== "100644" && match[1] !== "100755" && match[1] !== "120000"
+    ) {
+      throw new Error(`refusing unsupported index entry mode: ${match[4]}`);
+    }
   }
 }
 
@@ -677,13 +778,33 @@ function countLines(bytes: Uint8Array): number {
   return bytes.length && bytes.at(-1) !== 10 ? count + 1 : count;
 }
 
-type BaseEntry = { path: string; oid: string; mode: number };
-type FinalEntry = { path: string; mode: number };
+type BaseEntry = {
+  path: string;
+  oid: string;
+  mode: number;
+  size: number;
+  kind: EntryKind;
+};
+type FinalEntry = {
+  path: string;
+  mode: number;
+  size: number;
+  kind: EntryKind;
+};
 
+/**
+ * Inventory the base tree, including each blob's authoritative size.
+ *
+ * `-l` reports the size recorded in the base tree's own blob objects, so it is
+ * as immutable as the commit itself and costs no content read. That is what
+ * makes it safe to compare against `lstat`: unlike the index, the stat cache,
+ * or a worktree diff, nothing a certified invocation can write reaches it.
+ */
 async function baseTree(cwd: string, base: string): Promise<BaseEntry[]> {
   const output = await command(cwd, "git ls-tree base", [
     "ls-tree",
     "-r",
+    "-l",
     "-z",
     "--full-tree",
     base,
@@ -694,13 +815,26 @@ async function baseTree(cwd: string, base: string): Promise<BaseEntry[]> {
     throw new Error("malformed or oversized base-tree inventory");
   }
   return records.map((record) => {
-    const match = /^(100644|100755) blob ([0-9a-f]+)\t([\s\S]+)$/.exec(record);
+    // `-l` right-pads the size column to align it, hence the loose spacing.
+    // Mode 120000 is a symlink, whose blob content is its target path. It is
+    // admitted so that a repository merely containing tracked symlinks stays
+    // certifiable; a *change* to one is caught by comparing that blob against
+    // `Deno.readLink`. A gitlink has mode 160000 and type "commit" rather than
+    // "blob", so it cannot match here.
+    const match =
+      /^(100644|100755|120000) blob ([0-9a-f]+) +([0-9]+)\t([\s\S]+)$/
+        .exec(record);
     if (!match) throw new Error("base tree contains unsupported object type");
-    validateRepoPath(match[3]);
+    validateRepoPath(match[4]);
+    const symlink = match[1] === "120000";
     return {
-      path: match[3],
+      path: match[4],
       oid: match[2],
-      mode: match[1] === "100755" ? 0o755 : 0o644,
+      // Git records no permission bits for a symlink, so there is nothing to
+      // compare; 0 keeps it out of the file-mode comparison entirely.
+      mode: symlink ? 0 : match[1] === "100755" ? 0o755 : 0o644,
+      size: Number(match[3]),
+      kind: symlink ? "symlink" as const : "file" as const,
     };
   });
 }
@@ -743,15 +877,33 @@ async function finalTree(
           `refusing nested repository: ${relative}`,
         );
       }
-      if (entry.isDirectory) pending.push(path);
-      else if (!entry.isFile) {
+      // `readDir` reports a symlink as neither file nor directory even when it
+      // points at one, so this branch cannot enqueue a symlinked directory and
+      // the walk can never leave the worktree. The `.git` rejection above runs
+      // first, so a symlink named .git is still refused as a nested repository.
+      if (entry.isDirectory && !entry.isSymlink) pending.push(path);
+      else if (entry.isSymlink) {
+        validateRepoPath(relative);
+        // Recorded, not read. collectChanges compares the target against the
+        // base blob; a symlink absent from the base surfaces as an addition.
+        // `size` is left at 0 rather than the target length because nothing may
+        // draw a conclusion from it: `collectChanges` treats every symlink as a
+        // candidate and decides on the target bytes alone, so a stat-derived
+        // size here would be an unused value that looks comparable.
+        files.push({ path: relative, mode: 0, size: 0, kind: "symlink" });
+      } else if (!entry.isFile) {
         throw new Error(
           `refusing non-regular file: ${relative}`,
         );
       } else {
         validateRepoPath(relative);
         const stat = await Deno.lstat(path);
-        files.push({ path: relative, mode: (stat.mode ?? 0) & 0o777 });
+        files.push({
+          path: relative,
+          mode: (stat.mode ?? 0) & 0o777,
+          size: stat.size,
+          kind: "file",
+        });
       }
     }
   }
@@ -793,8 +945,130 @@ function gitMode(mode: number): number {
   return mode & 0o111 ? 0o755 : 0o644;
 }
 
+/**
+ * Union the paths Git itself reports as modified against the base.
+ *
+ * Purely additive. Git's answer depends on the index, the stat cache, and
+ * `.gitattributes` — all writable by the invocation being certified — so it can
+ * never be trusted to *clear* a path. It is consulted only to widen the
+ * candidate set, which costs nothing if it lies by omission.
+ */
+async function gitReportedChanges(
+  cwd: string,
+  base: string,
+): Promise<Set<string>> {
+  const reported = new Set<string>();
+  for (
+    const args of [
+      [
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-ext-diff",
+        "--no-textconv",
+        base,
+        "--",
+      ],
+      ["diff", "--cached", "--name-only", "-z", "--no-ext-diff", base, "--"],
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+    ]
+  ) {
+    const paths = await listRaw(
+      cwd,
+      args,
+      "git reported changes",
+      true,
+      MAX_REPOSITORY_PATHS,
+    );
+    for (const path of paths) reported.add(path);
+  }
+  return reported;
+}
+
+/**
+ * Prove that tracked files excluded from the candidate set are byte-identical
+ * to the base, without their content ever entering this process.
+ *
+ * Size and mode equality alone would leave one hole: an equal-length, equal-mode
+ * rewrite that Git also declines to report, which `--assume-unchanged` makes
+ * reachable. `hash-object` closes it by re-deriving each blob's object ID from
+ * worktree bytes. It reads no index and honours no stat cache, and `--no-filters`
+ * stops `.gitattributes` from feeding it substituted content, so a forged match
+ * would require a preimage attack on the repository's own hash. Hashing happens
+ * inside Git across a single subprocess, which is why this can cover a
+ * 190 MiB tree without approaching MAX_TOTAL_BYTES.
+ *
+ * `--stdin-paths` is strictly line-oriented with no NUL-delimited mode, so a
+ * newline-bearing path cannot be expressed to it. Those are returned to the
+ * caller for byte comparison rather than skipped.
+ *
+ * Batches are bounded by the command input limit rather than sent as one write,
+ * because a repository at the path ceiling can describe more path bytes than a
+ * single invocation accepts.
+ *
+ * Symlinks are deliberately never handed to `hash-object`, which follows them
+ * and would hash the *pointed-at* content — the one read that must never happen.
+ * They are returned to the caller for target comparison instead.
+ */
+async function verifyUnchanged(
+  cwd: string,
+  entries: BaseEntry[],
+  format: "sha1" | "sha256",
+): Promise<BaseEntry[]> {
+  const hashable = entries.filter((entry) =>
+    entry.kind === "file" && !entry.path.includes("\n")
+  );
+  const shape = format === "sha1" ? /^[0-9a-f]{40}$/ : /^[0-9a-f]{64}$/;
+  const encoder = new TextEncoder();
+  let batch: BaseEntry[] = [];
+  let batchBytes = 0;
+  const flush = async (): Promise<void> => {
+    if (!batch.length) return;
+    const output = await command(
+      cwd,
+      "git hash-object unchanged",
+      ["hash-object", "--no-filters", "--stdin-paths"],
+      [0],
+      true,
+      encoder.encode(batch.map((entry) => `${entry.path}\n`).join("")),
+    );
+    const oids = new TextDecoder("utf-8", { fatal: true })
+      .decode(output.stdout).split("\n").filter((line) => line.length);
+    if (oids.length !== batch.length) {
+      throw new Error(
+        "unchanged tracked inventory failed object-ID accounting",
+      );
+    }
+    for (const [index, entry] of batch.entries()) {
+      if (!shape.test(oids[index])) {
+        throw new Error(
+          "git hash-object unchanged returned malformed object ID",
+        );
+      }
+      if (oids[index] !== entry.oid) {
+        throw new Error(
+          `tracked file differs from base without a detectable change: ${entry.path}`,
+        );
+      }
+    }
+    batch = [];
+    batchBytes = 0;
+  };
+  for (const entry of hashable) {
+    const size = encoder.encode(`${entry.path}\n`).length;
+    if (batchBytes + size > MAX_COMMAND_BYTES) await flush();
+    batch.push(entry);
+    batchBytes += size;
+  }
+  await flush();
+  return entries.filter((entry) =>
+    entry.kind === "symlink" || entry.path.includes("\n")
+  );
+}
+
 async function collectChanges(
   cwd: string,
+  baseSha: string,
   base: BaseEntry[],
   final: FinalEntry[],
   ignored: Set<string>,
@@ -803,8 +1077,28 @@ async function collectChanges(
   const changes: Change[] = [];
   const finalByPath = new Map(final.map((entry) => [entry.path, entry]));
   const basePaths = new Set(base.map((entry) => entry.path));
-  let totalBytes = 0;
+  const reported = await gitReportedChanges(cwd, baseSha);
+  const candidates: BaseEntry[] = [];
+  const unchanged: BaseEntry[] = [];
   for (const entry of base) {
+    const current = finalByPath.get(entry.path);
+    // A deletion, a resize, a mode flip, or a change of entry kind is decided
+    // entirely from the base tree and an lstat, so no candidate can hide behind
+    // Git's bookkeeping. A symlink is always a candidate: its recorded size is
+    // not its target length, so only comparing the target itself can clear it.
+    if (
+      !current || current.kind !== entry.kind || entry.kind === "symlink" ||
+      current.size !== entry.size ||
+      gitMode(current.mode) !== entry.mode || reported.has(entry.path)
+    ) {
+      candidates.push(entry);
+    } else {
+      unchanged.push(entry);
+    }
+  }
+  candidates.push(...await verifyUnchanged(cwd, unchanged, format));
+  let totalBytes = 0;
+  for (const entry of candidates) {
     const current = finalByPath.get(entry.path);
     const baseBytes = (await command(cwd, "git cat-file base blob", [
       "cat-file",
@@ -815,15 +1109,19 @@ async function collectChanges(
       throw new Error(`base blob failed object-ID verification: ${entry.path}`);
     }
     const finalFile = current
-      ? await inspectRegular(cwd, entry.path)
+      ? await inspectEntry(cwd, entry.path, current.kind)
       : { bytes: new Uint8Array(), mode: 0 };
     totalBytes += baseBytes.length + finalFile.bytes.length;
     if (totalBytes > MAX_TOTAL_BYTES) {
       throw new Error("tracked state exceeds aggregate byte limit");
     }
+    // A base symlink whose target still matches is unchanged. Requiring the kind
+    // to match as well means replacing a symlink with a file whose bytes happen
+    // to equal the old target is a change, not a silent match.
     if (
+      current && current.kind === entry.kind &&
       equalBytes(baseBytes, finalFile.bytes) &&
-      entry.mode === gitMode(finalFile.mode)
+      (entry.kind === "symlink" || entry.mode === gitMode(finalFile.mode))
     ) {
       continue;
     }
@@ -835,7 +1133,7 @@ async function collectChanges(
   }
   for (const entry of final) {
     if (basePaths.has(entry.path) || ignored.has(entry.path)) continue;
-    const { bytes } = await inspectRegular(cwd, entry.path);
+    const { bytes } = await inspectEntry(cwd, entry.path, entry.kind);
     totalBytes += bytes.length;
     if (totalBytes > MAX_TOTAL_BYTES) {
       throw new Error("changed state exceeds aggregate byte limit");
@@ -843,7 +1141,10 @@ async function collectChanges(
     const binary = bytes.includes(0);
     changes.push({
       path: entry.path,
-      added: binary ? 0 : countLines(bytes),
+      // A newly added symlink counts as one added line: its target. Reporting it
+      // as a change is the point — an added symlink is how a packet would try to
+      // introduce a path that resolves outside the worktree.
+      added: binary ? 0 : entry.kind === "symlink" ? 1 : countLines(bytes),
       removed: 0,
       binary,
       untracked: true,
@@ -852,12 +1153,35 @@ async function collectChanges(
   return changes;
 }
 
+/**
+ * Classify what currently occupies a path, or null if nothing does.
+ *
+ * `lstat` never follows the final component, so a symlink is reported as a
+ * symlink rather than as whatever it points at. Callers that hold only a
+ * `Change` use this to pick the right reader after the fact.
+ */
+async function entryKind(path: string): Promise<EntryKind | null> {
+  let stat: Deno.FileInfo;
+  try {
+    stat = await Deno.lstat(path);
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return null;
+    throw error;
+  }
+  if (stat.isSymlink) return "symlink";
+  if (stat.isFile) return "file";
+  throw new Error(`refusing non-regular file: ${path}`);
+}
+
 async function passesWhitespaceCheck(
   cwd: string,
   changes: Change[],
 ): Promise<boolean> {
   for (const change of changes) {
-    if (change.binary || !await exists(`${cwd}/${change.path}`)) continue;
+    const kind = await entryKind(`${cwd}/${change.path}`);
+    // A symlink target is a path, not reviewable text; whitespace rules would be
+    // meaningless against it and reading it as content is not permitted anyway.
+    if (change.binary || kind !== "file") continue;
     const { bytes } = await inspectRegular(cwd, change.path);
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     const lines = text.split("\n");
@@ -872,6 +1196,15 @@ async function passesWhitespaceCheck(
   return true;
 }
 
+/**
+ * Bind the certified worktree state to a single digest.
+ *
+ * Each entry contributes its kind alongside its path, mode, and bytes. The kind
+ * is load-bearing, not decorative: without it a regular file containing
+ * `../../etc/passwd` and a symlink pointing at `../../etc/passwd` would frame
+ * identically and produce the same digest, so one could be swapped for the other
+ * under an unchanged hash. Adding it is what required HASH_VERSION v7.
+ */
 async function worktreeHash(
   cwd: string,
   base: string,
@@ -882,8 +1215,9 @@ async function worktreeHash(
   for (
     const change of changes.toSorted((a, b) => a.path.localeCompare(b.path))
   ) {
-    const inspected = await exists(`${cwd}/${change.path}`)
-      ? await inspectRegular(cwd, change.path)
+    const kind = await entryKind(`${cwd}/${change.path}`);
+    const inspected = kind
+      ? await inspectEntry(cwd, change.path, kind)
       : { bytes: new Uint8Array(), mode: 0 };
     const { bytes, mode } = inspected;
     total += bytes.length;
@@ -894,6 +1228,7 @@ async function worktreeHash(
     }
     parts.push(
       new TextEncoder().encode(change.path),
+      new TextEncoder().encode(kind ?? "absent"),
       new TextEncoder().encode(mode.toString(8)),
       bytes,
     );
@@ -962,7 +1297,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.25.1",
+  version: "2026.07.25.3",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -982,6 +1317,18 @@ export const model = {
   }, {
     toVersion: "2026.07.25.1",
     description: "Prune excluded ignored trees holding nested repositories",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.07.25.2",
+    description:
+      "Compare only candidate tracked paths to certify large repositories",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.07.25.3",
+    // Entry kind joined the hashed representation, so v6 digests are not
+    // comparable to v7 ones and stored evidence cannot be carried across.
+    description:
+      "Certify pre-existing tracked symlinks and raise the repository ceiling",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
@@ -1147,6 +1494,7 @@ export const model = {
         );
         const changes = await collectChanges(
           cwd,
+          base,
           baseEntries,
           finalEntries,
           new Set(ignoredPaths),
