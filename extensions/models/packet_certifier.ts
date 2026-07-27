@@ -23,6 +23,7 @@ const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 30_000;
+const MAX_TOTAL_LINE_DIFF_STEPS = 20_000_000;
 const IGNORED_SCOPE = "application-owned-v1";
 
 const IdString = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
@@ -913,27 +914,63 @@ async function finalTree(
   return files;
 }
 
+function textLines(bytes: Uint8Array): string[] {
+  if (!bytes.length) return [];
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const lines = text.split("\n");
+  if (text.endsWith("\n")) lines.pop();
+  return lines.map((line, index) =>
+    index < lines.length - 1 || text.endsWith("\n") ? `${line}\n` : line
+  );
+}
+
+function spendLineDiffStep(budget: { remaining: number }): void {
+  if (--budget.remaining < 0) {
+    throw new Error("line diff exceeds computation limit");
+  }
+}
+
 function lineDelta(
   base: Uint8Array,
   final: Uint8Array,
+  budget: { remaining: number },
 ): { added: number; removed: number } {
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const before = decoder.decode(base).split("\n");
-  const after = decoder.decode(final).split("\n");
-  let prefix = 0;
-  while (
-    prefix < before.length && prefix < after.length &&
-    before[prefix] === after[prefix]
-  ) prefix++;
-  let suffix = 0;
-  while (
-    suffix < before.length - prefix && suffix < after.length - prefix &&
-    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
-  ) suffix++;
-  return {
-    added: after.length - prefix - suffix,
-    removed: before.length - prefix - suffix,
-  };
+  const before = textLines(base);
+  const after = textLines(final);
+  const frontier = new Map<number, number>([[1, 0]]);
+
+  // Myers' shortest-edit-path algorithm counts only inserted and removed
+  // lines. Unlike trimming one common prefix and suffix, it does not charge
+  // every unchanged line between two small, separated hunks to the packet.
+  for (let distance = 0; distance <= before.length + after.length; distance++) {
+    for (let diagonal = -distance; diagonal <= distance; diagonal += 2) {
+      spendLineDiffStep(budget);
+      const down = frontier.get(diagonal + 1) ?? -1;
+      const right = frontier.get(diagonal - 1) ?? -1;
+      let x = diagonal === -distance ||
+          (diagonal !== distance && right < down)
+        ? down
+        : right + 1;
+      let y = x - diagonal;
+      while (
+        x < before.length && y < after.length && x >= 0 && y >= 0 &&
+        before[x] === after[y]
+      ) {
+        spendLineDiffStep(budget);
+        x++;
+        y++;
+      }
+      frontier.set(diagonal, x);
+      if (x >= before.length && y >= after.length) {
+        const delta = after.length - before.length;
+        return {
+          added: (distance + delta) / 2,
+          removed: (distance - delta) / 2,
+        };
+      }
+    }
+  }
+  throw new Error("line diff did not converge");
 }
 
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
@@ -1075,6 +1112,7 @@ async function collectChanges(
   format: "sha1" | "sha256",
 ): Promise<Change[]> {
   const changes: Change[] = [];
+  const lineDiffBudget = { remaining: MAX_TOTAL_LINE_DIFF_STEPS };
   const finalByPath = new Map(final.map((entry) => [entry.path, entry]));
   const basePaths = new Set(base.map((entry) => entry.path));
   const reported = await gitReportedChanges(cwd, baseSha);
@@ -1128,7 +1166,7 @@ async function collectChanges(
     const binary = baseBytes.includes(0) || finalFile.bytes.includes(0);
     const delta = binary
       ? { added: 0, removed: 0 }
-      : lineDelta(baseBytes, finalFile.bytes);
+      : lineDelta(baseBytes, finalFile.bytes, lineDiffBudget);
     changes.push({ path: entry.path, ...delta, binary });
   }
   for (const entry of final) {
@@ -1297,7 +1335,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.25.3",
+  version: "2026.07.26.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1329,6 +1367,10 @@ export const model = {
     // comparable to v7 ones and stored evidence cannot be carried across.
     description:
       "Certify pre-existing tracked symlinks and raise the repository ceiling",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.07.26.1",
+    description: "Count minimal line edits across separated hunks",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {

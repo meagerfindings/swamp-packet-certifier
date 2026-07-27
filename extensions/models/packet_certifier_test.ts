@@ -1431,3 +1431,61 @@ Deno.test("detects a deleted empty tracked file", async () => {
     await Deno.remove(cwd, { recursive: true });
   }
 });
+
+Deno.test("counts separated edits instead of unchanged lines between hunks", async () => {
+  const initial =
+    Array.from({ length: 1_200 }, (_, i) => `line ${i}`).join("\n") + "\n";
+  const cwd = await createRepo(initial);
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    const changed = initial.split("\n");
+    changed[100] = "changed near the start";
+    changed[1_000] = "changed near the end";
+    await Deno.writeTextFile(`${cwd}/README.md`, changed.join("\n"));
+
+    const report = await certify(cwd, h, ["README.md"], { maxChangedLines: 4 });
+    assertEquals(report.changedFiles[0].added, 2);
+    assertEquals(report.changedFiles[0].removed, 2);
+    assertEquals(report.budgetViolations.maxChangedLines, false);
+    assertEquals(report.passed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("counts insertions, deletions, empty files, and newline changes", async () => {
+  const cases = [
+    {
+      before: "one\nthree\n",
+      after: "one\ntwo\nthree\n",
+      added: 1,
+      removed: 0,
+    },
+    {
+      before: "one\ntwo\nthree\n",
+      after: "one\nthree\n",
+      added: 0,
+      removed: 1,
+    },
+    { before: "", after: "text", added: 1, removed: 0 },
+    { before: "text", after: "", added: 0, removed: 1 },
+    { before: "text\n", after: "text", added: 1, removed: 1 },
+    { before: "text", after: "text\n", added: 1, removed: 1 },
+  ];
+  for (const example of cases) {
+    const cwd = await createRepo(example.before);
+    try {
+      const h = harness();
+      await snapshot(cwd, h);
+      await Deno.writeTextFile(`${cwd}/README.md`, example.after);
+      const report = await certify(cwd, h, ["README.md"]);
+      assertEquals(report.changedFiles[0].added, example.added);
+      assertEquals(report.changedFiles[0].removed, example.removed);
+      assertEquals(Number.isInteger(report.changedFiles[0].added), true);
+      assertEquals(Number.isInteger(report.changedFiles[0].removed), true);
+    } finally {
+      await Deno.remove(cwd, { recursive: true });
+    }
+  }
+});
