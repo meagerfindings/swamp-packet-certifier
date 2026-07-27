@@ -52,6 +52,7 @@ const ReportSchema = z.object({
   hashVersion: z.literal(HASH_VERSION),
   packetId: IdString,
   invocationId: IdString,
+  snapshotInvocationId: IdString.optional(),
   rootBinding: HashString,
   worktreeStateHash: HashString,
   ignoredState: z.object({
@@ -1335,7 +1336,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.26.1",
+  version: "2026.07.27.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1371,6 +1372,11 @@ export const model = {
   }, {
     toVersion: "2026.07.26.1",
     description: "Count minimal line edits across separated hunks",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.07.27.1",
+    description:
+      "Allow certification of an effective fallback invocation against the original pre-agent ignored-state snapshot",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
@@ -1462,6 +1468,9 @@ export const model = {
         cwd: z.string().min(1).max(4_096),
         packetId: IdString,
         invocationId: IdString,
+        snapshotInvocationId: IdString.optional().describe(
+          "Invocation identity of the original pre-agent ignored-state snapshot; defaults to invocationId",
+        ),
         allowedPaths: z.array(PathString).min(1).max(MAX_PATHS),
         maxChangedFiles: z.number().int().min(1).max(20).default(3),
         maxChangedLines: z.number().int().min(1).max(2_000).default(120),
@@ -1482,16 +1491,24 @@ export const model = {
         );
         const packetId = args.packetId as string;
         const invocationId = args.invocationId as string;
+        const snapshotInvocationId =
+          (args.snapshotInvocationId as string | undefined) ?? invocationId;
         const snapshotName = await evidenceName(
           "ignored",
           packetId,
-          invocationId,
+          snapshotInvocationId,
         );
         const storedSnapshot = await context.readResource(snapshotName);
         if (!storedSnapshot) {
           throw new Error("pre-invocation ignored-state snapshot not found");
         }
         const parsedSnapshot = IgnoredSnapshotSchema.parse(storedSnapshot);
+        if (
+          parsedSnapshot.packetId !== packetId ||
+          parsedSnapshot.invocationId !== snapshotInvocationId
+        ) {
+          throw new Error("pre-invocation snapshot identity mismatch");
+        }
         if (!parsedSnapshot.ignoredScope) {
           throw new Error(
             "ignored-state snapshot predates application-owned scope; create a new invocation snapshot",
@@ -1550,7 +1567,7 @@ export const model = {
           ? {
             hashVersion: HASH_VERSION,
             packetId,
-            invocationId,
+            invocationId: snapshotInvocationId,
             resolvedBaseSha: base,
             objectFormat: expected.objectFormat,
             rootBinding: await rootBinding(cwd),
@@ -1564,7 +1581,7 @@ export const model = {
             ignoredPaths,
             policy.excludedPrefixes,
             packetId,
-            invocationId,
+            snapshotInvocationId,
             base,
             expected.objectFormat,
           );
@@ -1575,7 +1592,7 @@ export const model = {
             ignoredPaths,
             policy.excludedPrefixes,
             packetId,
-            invocationId,
+            snapshotInvocationId,
             base,
             expected.objectFormat,
           );
@@ -1623,6 +1640,7 @@ export const model = {
           hashVersion: HASH_VERSION,
           packetId,
           invocationId,
+          snapshotInvocationId,
           rootBinding: await rootBinding(cwd),
           worktreeStateHash: await worktreeHash(cwd, base, changes),
           ignoredState: { expected, current, changed, stable },

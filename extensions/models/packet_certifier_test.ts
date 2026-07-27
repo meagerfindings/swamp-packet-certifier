@@ -16,7 +16,16 @@ type Snapshot = {
 };
 
 type Report = {
+  packetId: string;
+  invocationId: string;
+  snapshotInvocationId?: string;
   passed: boolean;
+  ignoredState: {
+    expected: Snapshot;
+    current: Snapshot;
+    changed: boolean;
+    stable: boolean;
+  };
   rootBinding: string;
   worktreeStateHash: string;
   changedFiles: Array<{
@@ -139,6 +148,7 @@ async function certify(
   options: {
     packetId?: string;
     invocationId?: string;
+    snapshotInvocationId?: string;
     maxChangedFiles?: number;
     maxChangedLines?: number;
     checks?: Array<{
@@ -150,12 +160,14 @@ async function certify(
 ): Promise<Report> {
   const packetId = options.packetId ?? "packet-1";
   const invocationId = options.invocationId ?? "call-1";
+  const snapshotInvocationId = options.snapshotInvocationId ?? invocationId;
   if (
     ![...h.store.values()].some((value) =>
-      value.packetId === packetId && value.invocationId === invocationId
+      value.packetId === packetId &&
+      value.invocationId === snapshotInvocationId
     )
   ) {
-    await snapshot(cwd, h, packetId, invocationId);
+    await snapshot(cwd, h, packetId, snapshotInvocationId);
   }
   let report: Report | undefined;
   const originalWrite = h.context.writeResource;
@@ -168,6 +180,7 @@ async function certify(
       cwd,
       packetId,
       invocationId,
+      snapshotInvocationId: options.snapshotInvocationId,
       allowedPaths,
       maxChangedFiles: options.maxChangedFiles ?? 3,
       maxChangedLines: options.maxChangedLines ?? 120,
@@ -179,6 +192,27 @@ async function certify(
   if (!report) throw new Error("certification was not written");
   return report;
 }
+
+Deno.test("certifies a fallback invocation against the original snapshot identity", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h, "packet-1", "initial-call");
+    await Deno.writeTextFile(`${cwd}/README.md`, "fallback change\n");
+    const report = await certify(cwd, h, ["README.md"], {
+      invocationId: "fallback-call",
+      snapshotInvocationId: "initial-call",
+    });
+    assertEquals(report.passed, true);
+    assertEquals(report.invocationId, "fallback-call");
+    assertEquals(report.snapshotInvocationId, "initial-call");
+    assertEquals(report.ignoredState.expected.invocationId, "initial-call");
+    assertEquals(report.ignoredState.current.invocationId, "initial-call");
+    assertEquals(report.ignoredState.changed, false);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
 
 Deno.test("certifies ordinary unstaged text without persisting absolute roots", async () => {
   const cwd = await createRepo();
@@ -586,11 +620,20 @@ Deno.test("rejects an excluded prefix that is not the on-disk spelling", async (
     await Deno.writeTextFile(`${cwd}/Cache/generated`, "generated\n");
 
     // A case-insensitive filesystem resolves "cache" to "Cache", so every
-    // stat-based check would pass while byte-wise pruning matched nothing.
+    // stat-based check would pass while byte-wise pruning matched nothing. A
+    // case-sensitive filesystem rejects the incorrectly cased path earlier.
+    let expectedMessage = "excluded ignored prefix does not exist";
+    try {
+      await Deno.lstat(`${cwd}/cache`);
+      expectedMessage =
+        "excluded ignored prefix does not match the on-disk name";
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
     await assertRejects(
       () => snapshot(cwd, harness({ excludedIgnoredPathPrefixes: ["cache/"] })),
       Error,
-      "excluded ignored prefix does not match the on-disk name",
+      expectedMessage,
     );
   } finally {
     await Deno.remove(cwd, { recursive: true });
