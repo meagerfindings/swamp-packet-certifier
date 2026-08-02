@@ -3,7 +3,7 @@
 `@mgreten/packet-certifier` creates durable, structured evidence that a bounded
 implementation packet changed only approved files in a Git worktree. It resolves
 and records the base commit, handles tracked and untracked filenames safely,
-rejects symlink escapes and binary changes, tracks symlink retargeting, enforces
+rejects symlink escapes and unclaimed binary changes, verifies explicitly claimed binary SHA-256 digests, tracks symlink retargeting, enforces
 file and line budgets, protects ignored runtime trees with before/after hashes,
 and can evaluate a deterministic `git diff --check`-compatible policy internally
 without persisting source text. It is designed for attended agent workflows that
@@ -78,7 +78,8 @@ swamp model method run packet-certifier snapshotIgnoredState \
   --input cwd=/absolute/path/to/worktree \
   --input packetId=packet-001 \
   --input invocationId=invocation-001 \
-  --input baseRef=origin/main
+  --input baseRef=origin/main \
+  --input allowedBinaryFiles='[{"path":"public/icon.png","sha256":"<known-before-invocation>"}]'
 ```
 
 After the implementation process has exited, certify with the same packet and
@@ -130,11 +131,12 @@ rejected.
 | `packetId`     | `string` | yes      | Stable ID matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.                              |
 | `invocationId` | `string` | yes      | Invocation ID using the same restricted format.                                    |
 | `baseRef`      | `string` | no       | Git ref resolved to an immutable commit before invocation; defaults to `HEAD`.     |
+| `allowedBinaryFiles` | `{ path, sha256 }[]` | no | Exact binary paths and lowercase SHA-256 digests approved before invocation; defaults to `[]`. |
 
 The method writes an immutable packet/invocation-scoped resource with
 `hashVersion`, IDs, resolved base commit, Git object format, `stateHash`,
-`fileCount`, `excludedIgnoredPathPrefixes`, pseudonymous `rootBinding`, and
-`capturedAt`; it does not persist the absolute root or raw base-ref name.
+`fileCount`, `excludedIgnoredPathPrefixes`, immutable binary digest claims,
+pseudonymous `rootBinding`, and `capturedAt`; it does not persist the absolute root or raw base-ref name.
 `rootBinding` is deterministic and may be guessable for common paths, so treat
 it as pseudonymous rather than secret.
 
@@ -166,7 +168,7 @@ pre-invocation snapshot. During certification it verifies reachable objects with
 files directly with Deno, and compares bytes and permission modes without
 trusting Git's worktree diff, index flags, stat cache, attributes, or moving
 refs. Fatal UTF-8 decoding makes invalid UTF-8 paths fail closed. Hashes use the
-versioned `packet-certifier-v7` canonical encoding with an unsigned 64-bit
+versioned `packet-certifier-v8` canonical encoding with an unsigned 64-bit
 length before every field.
 
 Content comparison is confined to a candidate set so that a large repository can
@@ -228,6 +230,7 @@ Swamp's own data controls.
 ## Security Boundaries
 
 - Run only after the implementation process and its children have exited.
+- Supply binary digest claims only from trusted inputs known before the implementation invocation. Claims are immutable after the snapshot; missing, mismatched, duplicate, or unused claims fail certification.
 - Do not treat `passed: true` as a substitute for sandboxing, tests, code
   review, or human approval.
 - Record certification evidence immediately; later filesystem mutations are

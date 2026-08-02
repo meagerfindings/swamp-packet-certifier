@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { model } from "./packet_certifier.ts";
 
 type Snapshot = {
-  hashVersion: "packet-certifier-v7";
+  hashVersion: "packet-certifier-v8";
   packetId: string;
   invocationId: string;
   resolvedBaseSha: string;
@@ -12,6 +12,7 @@ type Snapshot = {
   stateHash: string;
   ignoredScope?: "application-owned-v1";
   excludedIgnoredPathPrefixes: string[];
+  allowedBinaryFiles: Array<{ path: string; sha256: string }>;
   capturedAt: string;
 };
 
@@ -36,7 +37,11 @@ type Report = {
   }>;
   pathViolations: string[];
   ignoredPathViolations: string[];
-  budgetViolations: { maxChangedLines: boolean; binaryFiles: string[] };
+  budgetViolations: {
+    maxChangedLines: boolean;
+    binaryFiles: string[];
+    binaryClaimViolations: string[];
+  };
   checkResults: Array<{ passed: boolean }>;
 };
 
@@ -121,6 +126,7 @@ async function snapshot(
   h: Harness,
   packetId = "packet-1",
   invocationId = "call-1",
+  allowedBinaryFiles: Array<{ path: string; sha256: string }> = [],
 ): Promise<Snapshot> {
   h.context.repoDir ??= cwd;
   let value: Snapshot | undefined;
@@ -131,7 +137,7 @@ async function snapshot(
   };
   try {
     await model.methods.snapshotIgnoredState.execute(
-      { cwd, packetId, invocationId, baseRef: "HEAD" },
+      { cwd, packetId, invocationId, baseRef: "HEAD", allowedBinaryFiles },
       h.context,
     );
   } finally {
@@ -932,6 +938,112 @@ Deno.test("replacement refs cannot substitute the bound base", async () => {
   }
 });
 
+Deno.test("certifies a binary only against its exact SHA-256 claim", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    const bytes = new Uint8Array([65, 0, 66]);
+    const digest = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", bytes.slice().buffer),
+    );
+    const sha256 = [...digest].map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+
+    await snapshot(cwd, h, "packet-1", "call-1", [
+      { path: "asset.png", sha256 },
+    ]);
+    await Deno.writeFile(`${cwd}/asset.png`, bytes);
+
+    const report = await certify(cwd, h, ["asset.png"]);
+
+    assertEquals(report.passed, true);
+    assertEquals(report.budgetViolations.binaryFiles, ["asset.png"]);
+    assertEquals(report.budgetViolations.binaryClaimViolations, []);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects an unclaimed binary beside a correctly claimed binary", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    const claimed = new Uint8Array([65, 0, 66]);
+    const digest = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", claimed.slice().buffer),
+    );
+    const sha256 = [...digest].map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    await snapshot(cwd, h, "packet-1", "call-1", [
+      { path: "claimed.png", sha256 },
+    ]);
+    await Deno.writeFile(`${cwd}/claimed.png`, claimed);
+    await Deno.writeFile(`${cwd}/unclaimed.png`, new Uint8Array([67, 0, 68]));
+
+    const report = await certify(cwd, h, ["claimed.png", "unclaimed.png"]);
+
+    assertEquals(report.passed, false);
+    assertEquals(report.budgetViolations.binaryClaimViolations, [
+      "unclaimed.png",
+    ]);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects duplicate binary claims before writing a snapshot", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await assertRejects(
+      () =>
+        snapshot(cwd, h, "packet-1", "call-1", [
+          { path: "asset.png", sha256: "0".repeat(64) },
+          { path: "asset.png", sha256: "1".repeat(64) },
+        ]),
+      Error,
+      "duplicate binary claim",
+    );
+    assertEquals(h.store.size, 0);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("certify cannot replace snapshot-bound binary claims", () => {
+  const parsed = model.methods.certify.arguments.safeParse({
+    cwd: "/tmp/repo",
+    packetId: "packet-1",
+    invocationId: "call-1",
+    allowedPaths: ["asset.png"],
+    allowedBinaryFiles: [{ path: "asset.png", sha256: "0".repeat(64) }],
+  });
+
+  assertEquals(parsed.success, false);
+});
+
+Deno.test("rejects missing, incorrect, and unused binary claims", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h, "packet-1", "call-1", [
+      { path: "asset.png", sha256: "0".repeat(64) },
+      { path: "unused.png", sha256: "1".repeat(64) },
+    ]);
+    await Deno.writeFile(`${cwd}/asset.png`, new Uint8Array([65, 0, 66]));
+
+    const report = await certify(cwd, h, ["asset.png"]);
+
+    assertEquals(report.passed, false);
+    assertEquals(report.budgetViolations.binaryClaimViolations, [
+      "asset.png",
+      "unused.png",
+    ]);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 Deno.test("rejects a binary base changed into clean text", async () => {
   const cwd = await createRepo(new Uint8Array([65, 0, 66]));
   try {
@@ -943,6 +1055,7 @@ Deno.test("rejects a binary base changed into clean text", async () => {
     const report = await certify(cwd, h, ["README.md", ".gitattributes"]);
     assertEquals(report.passed, false);
     assertEquals(report.budgetViolations.binaryFiles, ["README.md"]);
+    assertEquals(report.budgetViolations.binaryClaimViolations, ["README.md"]);
   } finally {
     await Deno.remove(cwd, { recursive: true });
   }

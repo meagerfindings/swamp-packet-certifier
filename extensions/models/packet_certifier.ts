@@ -5,7 +5,7 @@
  */
 import { z } from "npm:zod@4.4.3";
 
-const HASH_VERSION = "packet-certifier-v7";
+const HASH_VERSION = "packet-certifier-v8";
 const SHA256 = /^[0-9a-f]{64}$/;
 // The packet limit: how many files one approved packet may change, and how many
 // ignored files this model will hash. It is a policy ceiling on the size of a
@@ -30,6 +30,10 @@ const IdString = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 const ShortString = z.string().min(1).max(256);
 const PathString = z.string().min(1).max(1_024);
 const HashString = z.string().regex(SHA256);
+const BinaryClaimSchema = z.object({
+  path: PathString,
+  sha256: HashString,
+}).strict();
 const Count = z.number().int().nonnegative();
 const SnapshotBindingSchema = z.object({
   hashVersion: z.literal(HASH_VERSION),
@@ -45,6 +49,7 @@ const SnapshotBindingSchema = z.object({
 }).strict();
 
 const IgnoredSnapshotSchema = SnapshotBindingSchema.extend({
+  allowedBinaryFiles: z.array(BinaryClaimSchema).max(20),
   capturedAt: z.string().datetime(),
 }).strict();
 
@@ -82,6 +87,7 @@ const ReportSchema = z.object({
     maxChangedFiles: z.boolean(),
     maxChangedLines: z.boolean(),
     binaryFiles: z.array(PathString).max(MAX_PATHS),
+    binaryClaimViolations: z.array(PathString).max(MAX_PATHS),
   }).strict(),
   checkResults: z.array(
     z.object({
@@ -106,6 +112,7 @@ const ReportSchema = z.object({
       }).strict(),
     ).max(1),
     allowBinary: z.literal(false),
+    allowedBinaryFiles: z.array(BinaryClaimSchema).max(20),
     allowedIgnoredPaths: z.array(PathString).max(MAX_PATHS),
     allowedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
     excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
@@ -1244,12 +1251,18 @@ async function passesWhitespaceCheck(
  * identically and produce the same digest, so one could be swapped for the other
  * under an unchanged hash. Adding it is what required HASH_VERSION v7.
  */
-async function worktreeHash(
+type WorktreeEvidence = {
+  stateHash: string;
+  binaryDigests: Map<string, string | null>;
+};
+
+async function captureWorktreeEvidence(
   cwd: string,
   base: string,
   changes: Change[],
-): Promise<string> {
+): Promise<WorktreeEvidence> {
   const parts: Uint8Array[] = [];
+  const binaryDigests = new Map<string, string | null>();
   let total = 0;
   for (
     const change of changes.toSorted((a, b) => a.path.localeCompare(b.path))
@@ -1265,6 +1278,12 @@ async function worktreeHash(
         "worktree state exceeds aggregate byte limit",
       );
     }
+    if (change.binary || bytes.includes(0)) {
+      binaryDigests.set(
+        change.path,
+        kind === "file" ? await sha256(bytes) : null,
+      );
+    }
     parts.push(
       new TextEncoder().encode(change.path),
       new TextEncoder().encode(kind ?? "absent"),
@@ -1273,7 +1292,10 @@ async function worktreeHash(
     );
   }
   parts.push(new TextEncoder().encode(base));
-  return await canonicalHash(parts);
+  return {
+    stateHash: await canonicalHash(parts),
+    binaryDigests,
+  };
 }
 
 /**
@@ -1336,7 +1358,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.07.27.1",
+  version: "2026.08.02.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1378,6 +1400,11 @@ export const model = {
     description:
       "Allow certification of an effective fallback invocation against the original pre-agent ignored-state snapshot",
     upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.08.02.1",
+    description:
+      "Bind explicitly claimed binary SHA-256 digests into pre-invocation snapshots",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
     ignoredSnapshot: {
@@ -1403,6 +1430,7 @@ export const model = {
         packetId: IdString,
         invocationId: IdString,
         baseRef: z.string().min(1).max(256).default("HEAD"),
+        allowedBinaryFiles: z.array(BinaryClaimSchema).max(20).default([]),
       }).strict(),
       execute: async (
         args: Record<string, unknown>,
@@ -1423,6 +1451,17 @@ export const model = {
         const resolvedBaseSha = await resolveBase(cwd, args.baseRef as string);
         const format = await objectFormat(cwd);
         const policy = ignoredPolicy(context);
+        const allowedBinaryFiles = (args.allowedBinaryFiles ?? []) as Array<
+          z.infer<typeof BinaryClaimSchema>
+        >;
+        const claimedPaths = new Set<string>();
+        for (const claim of allowedBinaryFiles) {
+          validateRepoPath(claim.path);
+          if (claimedPaths.has(claim.path)) {
+            throw new Error(`duplicate binary claim: ${claim.path}`);
+          }
+          claimedPaths.add(claim.path);
+        }
         await validateExcludedIgnoredPrefixes(cwd, policy.excludedPrefixes);
         const paths = await listIgnoredPaths(
           cwd,
@@ -1447,6 +1486,7 @@ export const model = {
             resolvedBaseSha,
             format,
           ),
+          allowedBinaryFiles,
           capturedAt: new Date().toISOString(),
         });
         return {
@@ -1514,7 +1554,11 @@ export const model = {
             "ignored-state snapshot predates application-owned scope; create a new invocation snapshot",
           );
         }
-        const { capturedAt: _capturedAt, ...expected } = parsedSnapshot;
+        const {
+          capturedAt: _capturedAt,
+          allowedBinaryFiles,
+          ...expected
+        } = parsedSnapshot;
         const allowedPaths = args.allowedPaths as string[];
         for (const path of allowedPaths) validateRepoPath(path);
         await rejectExecutableFilters(cwd);
@@ -1603,9 +1647,25 @@ export const model = {
         const pathViolations = changes.filter((change) =>
           !allowed.has(change.path)
         ).map((change) => change.path);
-        const binaryFiles = changes.filter((change) => change.binary).map((
-          change,
-        ) => change.path);
+        const worktreeEvidence = await captureWorktreeEvidence(
+          cwd,
+          base,
+          changes,
+        );
+        const binaryFiles = [...worktreeEvidence.binaryDigests.keys()];
+        const binaryClaims = new Map(
+          allowedBinaryFiles.map((claim) => [claim.path, claim.sha256]),
+        );
+        const changedBinaryPaths = new Set(binaryFiles);
+        const binaryClaimViolations = allowedBinaryFiles
+          .filter((claim) => !changedBinaryPaths.has(claim.path))
+          .map((claim) => claim.path);
+        for (const [path, digest] of worktreeEvidence.binaryDigests) {
+          if (!digest || binaryClaims.get(path) !== digest) {
+            binaryClaimViolations.push(path);
+          }
+        }
+        binaryClaimViolations.sort();
         const totalAdded = changes.reduce(
           (sum, change) => sum + change.added,
           0,
@@ -1635,14 +1695,15 @@ export const model = {
         const passed = !pathViolations.length &&
           !ignoredPathViolations.length && !changed && stable &&
           changes.length <= maxFiles && totalAdded + totalRemoved <= maxLines &&
-          !binaryFiles.length && checkResults.every((result) => result.passed);
+          !binaryClaimViolations.length &&
+          checkResults.every((result) => result.passed);
         const report = ReportSchema.parse({
           hashVersion: HASH_VERSION,
           packetId,
           invocationId,
           snapshotInvocationId,
           rootBinding: await rootBinding(cwd),
-          worktreeStateHash: await worktreeHash(cwd, base, changes),
+          worktreeStateHash: worktreeEvidence.stateHash,
           ignoredState: { expected, current, changed, stable },
           changedFiles: changes,
           counts: {
@@ -1657,6 +1718,7 @@ export const model = {
             maxChangedFiles: changes.length > maxFiles,
             maxChangedLines: totalAdded + totalRemoved > maxLines,
             binaryFiles,
+            binaryClaimViolations,
           },
           checkResults,
           resolvedBaseSha: base,
@@ -1666,6 +1728,7 @@ export const model = {
             maxChangedLines: maxLines,
             checks,
             allowBinary: false as const,
+            allowedBinaryFiles,
             allowedIgnoredPaths: [...policy.exact],
             allowedIgnoredPathPrefixes: policy.prefixes,
             excludedIgnoredPathPrefixes: policy.excludedPrefixes,
