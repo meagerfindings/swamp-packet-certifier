@@ -19,10 +19,20 @@ const MAX_PATHS = 1_000;
 // inventories cost single-digit MiB of strings, which real monoliths need: an
 // 18k-file Rails application already presents 22k filesystem entries.
 const MAX_REPOSITORY_PATHS = 100_000;
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
-const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
+// Raised from 10/50 MiB during the 2026-08-08 CompanyCam incident: candidate
+// content on a live monorepo (large generated fixtures, checked-in binary
+// assets) exceeded the old caps even though only a handful of files were
+// actual packet candidates. The cap remains a fail-closed ceiling, not a
+// removal — MAX_COMMAND_BYTES and the per-candidate read path are unchanged.
+const MAX_FILE_BYTES = 128 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
-const COMMAND_TIMEOUT_MS = 30_000;
+// Raised from 30s alongside the byte ceilings above: a 60 MiB+ Git command
+// (hash-object/cat-file batches, ls-tree over 22k paths) on a cold FS cache
+// can outrun a 30s abort on real CompanyCam-scale monorepos. This governs the
+// AbortController deadline for every `command()` invocation below, including
+// the one that carries `core.commitGraph=false`.
+const COMMAND_TIMEOUT_MS = 60_000;
 const MAX_TOTAL_LINE_DIFF_STEPS = 20_000_000;
 const IGNORED_SCOPE = "application-owned-v1";
 
@@ -243,6 +253,14 @@ async function command(
         "diff.external=",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        // Disabled during the 2026-08-08 incident: a stale or mid-write
+        // commit-graph file on a large, actively-developed repository can
+        // make ordinary rev-walk/log-adjacent Git commands (used internally
+        // by ls-tree/diff plumbing) stall or read corrupt cached ancestry
+        // data. Certification only ever needs exact object/tree state, which
+        // core.commitGraph=false forces Git to derive without the cache.
+        "core.commitGraph=false",
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
@@ -1358,7 +1376,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.08.02.1",
+  version: "2026.08.08.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1404,6 +1422,11 @@ export const model = {
     toVersion: "2026.08.02.1",
     description:
       "Bind explicitly claimed binary SHA-256 digests into pre-invocation snapshots",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.08.08.1",
+    description:
+      "Raise candidate byte ceilings, extend the Git command timeout, and disable the commit-graph cache for CompanyCam-scale repositories",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {

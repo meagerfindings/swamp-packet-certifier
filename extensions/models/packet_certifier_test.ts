@@ -1358,6 +1358,108 @@ Deno.test("certifies a repository whose tracked content exceeds the aggregate by
   }
 });
 
+Deno.test("certifies a repository whose tracked content exceeds the former aggregate byte limit but stays within the raised one", async () => {
+  const cwd = await createRepo();
+  try {
+    // 64 MiB exceeded the old 50 MiB MAX_TOTAL_BYTES (see the test above,
+    // which predates the 2026-08-08 incident raise to 256 MiB). Push past
+    // that former ceiling into territory the raised limit must still admit,
+    // proving the incident's byte-limit change actually took effect rather
+    // than merely shifting the constant without widening the code path.
+    await Deno.mkdir(`${cwd}/bulk`);
+    const megabyte = new Uint8Array(1024 * 1024).fill(98);
+    for (let i = 0; i < 200; i++) {
+      await Deno.writeFile(`${cwd}/bulk/${i}.dat`, megabyte);
+    }
+    await gitOutput(cwd, ["add", "bulk"]);
+    await gitOutput(cwd, [
+      "-c",
+      "user.name=Packet Certifier Test",
+      "-c",
+      "user.email=packet-certifier@example.test",
+      "commit",
+      "-m",
+      "bulk tracked content beyond the former ceiling",
+    ]);
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.passed, true);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("fails closed on a single candidate file exceeding the raised per-file byte limit", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    // 129 MiB exceeds the raised 128 MiB MAX_FILE_BYTES. The file must be a
+    // candidate (its path is in allowedPaths) so the per-file check is what
+    // trips, not the aggregate check.
+    const chunk = new Uint8Array(1024 * 1024).fill(99);
+    const handle = await Deno.open(`${cwd}/README.md`, {
+      write: true,
+      truncate: true,
+    });
+    for (let i = 0; i < 129; i++) {
+      await handle.write(chunk);
+    }
+    handle.close();
+
+    await assertRejects(
+      () => certify(cwd, h, ["README.md"]),
+      Error,
+      "file exceeds byte limit",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("fails closed on aggregate candidate bytes exceeding the raised total byte limit", async () => {
+  const cwd = await createRepo();
+  try {
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.mkdir(`${cwd}/bulk`);
+    const megabyte = new Uint8Array(1024 * 1024).fill(100);
+    // Three untracked candidate files at 90 MiB each: none trips the 128 MiB
+    // per-file limit individually, but their 270 MiB sum exceeds the raised
+    // 256 MiB MAX_TOTAL_BYTES aggregate. Untracked (rather than tracked and
+    // modified) so worktree bytes are read directly via inspectEntry, not
+    // through a `git cat-file blob` call bounded by the separate 4 MiB
+    // MAX_COMMAND_BYTES output cap.
+    for (let i = 0; i < 3; i++) {
+      const handle = await Deno.open(`${cwd}/bulk/${i}.dat`, {
+        write: true,
+        create: true,
+      });
+      for (let j = 0; j < 90; j++) {
+        await handle.write(megabyte);
+      }
+      handle.close();
+    }
+
+    await assertRejects(
+      () =>
+        certify(cwd, h, ["bulk/0.dat", "bulk/1.dat", "bulk/2.dat"], {
+          maxChangedFiles: 5,
+        }),
+      Error,
+      "exceeds aggregate byte limit",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
 async function exists(path: string): Promise<boolean> {
   try {
     await Deno.stat(path);
@@ -1643,5 +1745,198 @@ Deno.test("counts insertions, deletions, empty files, and newline changes", asyn
     } finally {
       await Deno.remove(cwd, { recursive: true });
     }
+  }
+});
+
+/**
+ * Install a `git` shim ahead of the real binary on PATH that sleeps once
+ * (past the former 30s COMMAND_TIMEOUT_MS but under the current 60s one)
+ * before delegating to the real `git` for every invocation, including the
+ * one it delayed. Callers must restore PATH in a `finally` so a failed test
+ * cannot leak the override into later tests.
+ */
+async function installSlowGitOnce(
+  delaySeconds: number,
+): Promise<{ shimDir: string; restore: () => Promise<void> }> {
+  const shimDir = await Deno.makeTempDir();
+  const marker = `${shimDir}/.slept`;
+  await Deno.writeTextFile(
+    `${shimDir}/git`,
+    `#!/bin/sh\n` +
+      `if [ -f '${marker}' ]; then\n` +
+      `  exec /usr/bin/git "$@"\n` +
+      `else\n` +
+      `  touch '${marker}'\n` +
+      `  sleep ${delaySeconds}\n` +
+      `  exec /usr/bin/git "$@"\n` +
+      `fi\n`,
+  );
+  await Deno.chmod(`${shimDir}/git`, 0o755);
+  const originalPath = Deno.env.get("PATH") ?? "/usr/bin:/bin";
+  Deno.env.set("PATH", `${shimDir}:${originalPath}`);
+  return {
+    shimDir,
+    restore: async () => {
+      Deno.env.set("PATH", originalPath);
+      await Deno.remove(shimDir, { recursive: true });
+    },
+  };
+}
+
+Deno.test({
+  name:
+    "certifies successfully when one Git invocation takes longer than the former 30s timeout but under the raised 60s one",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    const cwd = await createRepo();
+    const shim = await installSlowGitOnce(35);
+    try {
+      const h = harness();
+      await snapshot(cwd, h);
+      await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+      const report = await certify(cwd, h, ["README.md"]);
+      assertEquals(report.passed, true);
+    } finally {
+      await shim.restore();
+      await Deno.remove(cwd, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "a Git invocation past the 60s ceiling fails closed (generic failure; typed timeout is a tracked follow-up)",
+  ignore: Deno.build.os === "windows",
+  fn: async () => {
+    // command()'s catch block collapses an AbortController timeout and an
+    // ordinary non-zero exit into the same generic `${label} failed` error —
+    // there is no distinct typed timeout class to assert on here, only that
+    // the call fails closed rather than hanging forever. Introducing a typed
+    // timeout error is tracked separately and intentionally out of scope for
+    // this incident port.
+    //
+    // A shim that never delegates simulates a hung Git process (e.g. lock
+    // contention, a stalled filesystem). COMMAND_TIMEOUT_MS is not
+    // test-injectable (it is a module-level const, and the model exports
+    // only `model`), so this test genuinely waits out the real 60s abort
+    // deadline rather than a shortened one — it is a slow, real-time test by
+    // necessity, not by oversight. The shim sleeps 600s so the wait is
+    // bounded by the abort at 60s rather than by the shim's own sleep.
+    // `exec` replaces the shell's own process image with `sleep`, so the
+    // AbortController's SIGTERM lands on the process actually holding the
+    // stdout/stderr pipes open — a bare (non-exec'd) `sleep` would run as a
+    // grandchild that keeps the pipes open after the shell dies, so
+    // Deno.Command.output() would hang until the real 600s elapsed instead
+    // of returning at the abort deadline.
+    const shimDir = await Deno.makeTempDir();
+    await Deno.writeTextFile(`${shimDir}/git`, `#!/bin/sh\nexec sleep 600\n`);
+    await Deno.chmod(`${shimDir}/git`, 0o755);
+    const originalPath = Deno.env.get("PATH") ?? "/usr/bin:/bin";
+    const cwd = await createRepo();
+    try {
+      // snapshotIgnoredState's first internal Git call is "git rev-parse"
+      // (canonicalRepoRoot); it never returns, so the whole call must fail
+      // once COMMAND_TIMEOUT_MS elapses rather than hang forever.
+      Deno.env.set("PATH", `${shimDir}:${originalPath}`);
+      const h = harness();
+      await assertRejects(
+        () => snapshot(cwd, h),
+        Error,
+        "git rev-parse failed",
+      );
+    } finally {
+      Deno.env.set("PATH", originalPath);
+      await Deno.remove(shimDir, { recursive: true });
+      await Deno.remove(cwd, { recursive: true });
+    }
+  },
+});
+
+Deno.test("core.commitGraph=false silences stale commit-graph errors that a default-configured Git invocation surfaces", async () => {
+  const cwd = await createRepo();
+  try {
+    // A second commit gives commit-graph write something non-trivial to
+    // record so corrupting it is meaningful.
+    await Deno.writeTextFile(`${cwd}/README.md`, "second\n");
+    await gitOutput(cwd, ["add", "README.md"]);
+    await gitOutput(cwd, [
+      "-c",
+      "user.name=Packet Certifier Test",
+      "-c",
+      "user.email=packet-certifier@example.test",
+      "commit",
+      "-m",
+      "second",
+    ]);
+    await gitOutput(cwd, ["commit-graph", "write", "--reachable"]);
+    const graphPath = `${cwd}/.git/objects/info/commit-graph`;
+    if (!(await exists(graphPath))) {
+      throw new Error("expected git commit-graph write to produce a file");
+    }
+    // Flip bytes past the header so Git's chunk-table parse fails rather than
+    // its magic-number check, matching the "stale/corrupt commit-graph"
+    // condition the 2026-08-08 incident hit on an actively-developed
+    // repository.
+    const bytes = await Deno.readFile(graphPath);
+    for (let i = 20; i < Math.min(60, bytes.length); i++) bytes[i] = 0xff;
+    // Git writes commit-graph files read-only; reopen for write explicitly.
+    await Deno.chmod(graphPath, 0o644);
+    await Deno.writeFile(graphPath, bytes);
+
+    // Discriminating half: reproduce, against this exact corrupted file,
+    // what an empirical run confirmed — `git -c core.commitGraph=true
+    // rev-parse --verify HEAD^{commit}` (Git's default) exits 0 but writes
+    // "error: improper chunk offset(s) ..." to stderr, while the same
+    // command with `-c core.commitGraph=false` produces no stderr at all.
+    // Without this half, a test that only checks certify()'s report proves
+    // nothing: Git falls back and reports success either way, so a report
+    // of `passed: true` cannot tell whether the flag reached Git.
+    const withDefault = await new Deno.Command("git", {
+      args: ["-c", "core.commitGraph=true", "rev-parse", "--verify", "HEAD^{commit}"],
+      cwd,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const withFlagDisabled = await new Deno.Command("git", {
+      args: ["-c", "core.commitGraph=false", "rev-parse", "--verify", "HEAD^{commit}"],
+      cwd,
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    const defaultStderr = new TextDecoder().decode(withDefault.stderr);
+    const disabledStderr = new TextDecoder().decode(withFlagDisabled.stderr);
+    if (!defaultStderr.includes("improper chunk offset")) {
+      throw new Error(
+        "corrupted commit-graph fixture did not reproduce Git's stale-cache " +
+          "error under the default configuration — the fixture is not " +
+          "exercising what this test claims",
+      );
+    }
+    assertEquals(disabledStderr, "");
+
+    // Static half: pin that the model's own command() helper always passes
+    // this exact flag on every Git invocation, not only in this test's
+    // hand-rolled comparison above.
+    const source = await Deno.readTextFile(
+      new URL("./packet_certifier.ts", import.meta.url),
+    );
+    if (!source.includes('"core.commitGraph=false"')) {
+      throw new Error(
+        "packet_certifier.ts no longer passes -c core.commitGraph=false to Git",
+      );
+    }
+
+    // Model-level half: certification against the same corrupted repository
+    // still reports passed: true and the correct changed file.
+    const h = harness();
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/README.md`, "changed\n");
+    const report = await certify(cwd, h, ["README.md"]);
+    assertEquals(report.passed, true);
+    assertEquals(report.changedFiles.map((change) => change.path), [
+      "README.md",
+    ]);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
   }
 });
