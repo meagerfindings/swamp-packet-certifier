@@ -2,7 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { model } from "./packet_certifier.ts";
 
 type Snapshot = {
-  hashVersion: "packet-certifier-v8";
+  hashVersion: "packet-certifier-v9";
   packetId: string;
   invocationId: string;
   resolvedBaseSha: string;
@@ -12,6 +12,7 @@ type Snapshot = {
   stateHash: string;
   ignoredScope?: "application-owned-v1";
   excludedIgnoredPathPrefixes: string[];
+  mayVaryIgnoredPathPrefixes: string[];
   allowedBinaryFiles: Array<{ path: string; sha256: string }>;
   capturedAt: string;
 };
@@ -53,6 +54,7 @@ type Harness = {
       allowedIgnoredPaths: string[];
       allowedIgnoredPathPrefixes: string[];
       excludedIgnoredPathPrefixes: string[];
+      mayVaryIgnoredPathPrefixes: string[];
     };
     readResource: (name: string) => Promise<Record<string, unknown> | null>;
     writeResource: (
@@ -67,6 +69,7 @@ function harness(globalArgs: {
   allowedIgnoredPaths?: string[];
   allowedIgnoredPathPrefixes?: string[];
   excludedIgnoredPathPrefixes?: string[];
+  mayVaryIgnoredPathPrefixes?: string[];
 } = {}): Harness {
   const store = new Map<string, Record<string, unknown>>();
   return {
@@ -76,6 +79,8 @@ function harness(globalArgs: {
         allowedIgnoredPaths: globalArgs.allowedIgnoredPaths ?? [],
         allowedIgnoredPathPrefixes: globalArgs.allowedIgnoredPathPrefixes ?? [],
         excludedIgnoredPathPrefixes: globalArgs.excludedIgnoredPathPrefixes ??
+          [],
+        mayVaryIgnoredPathPrefixes: globalArgs.mayVaryIgnoredPathPrefixes ??
           [],
       },
       readResource: (name) => Promise.resolve(store.get(name) ?? null),
@@ -455,6 +460,156 @@ Deno.test("detects ignored content and permission changes", async () => {
     assertEquals(
       [...h.store.values()].find((value) => value.capturedAt)?.stateHash,
       before.stateHash,
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("permits a may-vary ignored path to change content and mode", async () => {
+  // The motivating bug: an attended invocation runs a build step (e.g.
+  // rspec) that legitimately writes to an ignored log file mid-run.
+  // A may-vary prefix must let that content vary without failing
+  // certification, unlike an allow-listed prefix (see the previous test).
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "log/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore log"]);
+    await Deno.mkdir(`${cwd}/log`);
+    await Deno.writeTextFile(`${cwd}/log/test.log`, "before\n", {
+      mode: 0o600,
+    });
+    const h = harness({ mayVaryIgnoredPathPrefixes: ["log/"] });
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/log/test.log`, "rspec output\n", {
+      mode: 0o644,
+    });
+    await Deno.writeTextFile(`${cwd}/log/new.log`, "new file\n");
+    const report = await certify(cwd, h, ["README.md"]);
+
+    assertEquals(report.passed, true);
+    assertEquals(report.ignoredState.changed, false);
+    assertEquals(report.ignoredPathViolations, []);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("still content-pins an allow-listed path beside an unrelated may-vary prefix", async () => {
+  // Guards against a regression where introducing may-vary loosens the
+  // allow-list's content pin for secrets.
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "secret.env\nlog/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore secret and log"]);
+    await Deno.writeTextFile(`${cwd}/secret.env`, "TOKEN=before\n");
+    await Deno.mkdir(`${cwd}/log`);
+    await Deno.writeTextFile(`${cwd}/log/test.log`, "before\n");
+    const h = harness({
+      allowedIgnoredPaths: ["secret.env"],
+      mayVaryIgnoredPathPrefixes: ["log/"],
+    });
+    await snapshot(cwd, h);
+    await Deno.writeTextFile(`${cwd}/log/test.log`, "after\n");
+    const passingReport = await certify(cwd, h, ["README.md"], {
+      invocationId: "call-1",
+    });
+    assertEquals(passingReport.passed, true);
+
+    await Deno.writeTextFile(`${cwd}/secret.env`, "TOKEN=after\n");
+    const failingReport = await certify(cwd, h, ["README.md"], {
+      invocationId: "call-2",
+      snapshotInvocationId: "call-1",
+    });
+    assertEquals(failingReport.passed, false);
+    assertEquals(failingReport.ignoredState.changed, true);
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects an unlisted ignored path even with a may-vary policy configured", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "log/\nother/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore log and other"]);
+    await Deno.mkdir(`${cwd}/other`);
+    await Deno.writeTextFile(`${cwd}/other/file`, "data\n");
+    const h = harness({ mayVaryIgnoredPathPrefixes: ["log/"] });
+
+    await assertRejects(
+      () => snapshot(cwd, h),
+      Error,
+      "ignored path is not permitted by policy: other/file",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects a may-vary prefix that changes between snapshot and certify", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.writeTextFile(`${cwd}/.gitignore`, "log/\n");
+    await gitOutput(cwd, ["add", ".gitignore"]);
+    await gitOutput(cwd, ["commit", "-m", "ignore log"]);
+    await Deno.mkdir(`${cwd}/log`);
+    await Deno.writeTextFile(`${cwd}/log/test.log`, "data\n");
+    const h = harness({ mayVaryIgnoredPathPrefixes: ["log/"] });
+    await snapshot(cwd, h);
+    h.context.globalArgs.mayVaryIgnoredPathPrefixes = [];
+
+    await assertRejects(
+      () => certify(cwd, h, ["README.md"]),
+      Error,
+      "may-vary ignored path policy differs from pre-invocation snapshot",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects a may-vary prefix that overlaps a content-pinned allow-list prefix", async () => {
+  // A may-vary prefix exempts its paths from stateHash. If it overlapped an
+  // allow-listed (content-pinned) prefix, the operator would silently un-pin a
+  // path they meant to freeze (e.g. a secret). The policy must reject the
+  // overlap so exempting a pinned path is always a deliberate edit.
+  const cwd = await createRepo();
+  try {
+    await Deno.mkdir(`${cwd}/log`);
+    await Deno.writeTextFile(`${cwd}/log/secret.env`, "TOKEN=x\n");
+    const h = harness({
+      allowedIgnoredPathPrefixes: ["log/secrets/"],
+      mayVaryIgnoredPathPrefixes: ["log/"],
+    });
+
+    await assertRejects(
+      () => snapshot(cwd, h),
+      Error,
+      "allowed and may-vary ignored path policies overlap",
+    );
+  } finally {
+    await Deno.remove(cwd, { recursive: true });
+  }
+});
+
+Deno.test("rejects a may-vary prefix that covers a content-pinned exact allow-list path", async () => {
+  const cwd = await createRepo();
+  try {
+    await Deno.mkdir(`${cwd}/log`);
+    await Deno.writeTextFile(`${cwd}/log/secret.env`, "TOKEN=x\n");
+    const h = harness({
+      allowedIgnoredPaths: ["log/secret.env"],
+      mayVaryIgnoredPathPrefixes: ["log/"],
+    });
+
+    await assertRejects(
+      () => snapshot(cwd, h),
+      Error,
+      "allowed and may-vary ignored path policies overlap",
     );
   } finally {
     await Deno.remove(cwd, { recursive: true });

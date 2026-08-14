@@ -5,7 +5,7 @@
  */
 import { z } from "npm:zod@4.4.3";
 
-const HASH_VERSION = "packet-certifier-v8";
+const HASH_VERSION = "packet-certifier-v9";
 const SHA256 = /^[0-9a-f]{64}$/;
 // The packet limit: how many files one approved packet may change, and how many
 // ignored files this model will hash. It is a policy ceiling on the size of a
@@ -56,6 +56,7 @@ const SnapshotBindingSchema = z.object({
   stateHash: HashString,
   ignoredScope: z.literal(IGNORED_SCOPE).optional(),
   excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
+  mayVaryIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS).default([]),
 }).strict();
 
 const IgnoredSnapshotSchema = SnapshotBindingSchema.extend({
@@ -126,15 +127,34 @@ const ReportSchema = z.object({
     allowedIgnoredPaths: z.array(PathString).max(MAX_PATHS),
     allowedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
     excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
+    mayVaryIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS),
   }).strict(),
   passed: z.boolean(),
   checkedAt: z.string().datetime(),
 }).strict();
 
 const GlobalArgsSchema = z.object({
+  // Permitted to exist AND content-pinned: any content/mode/kind mutation of
+  // a path matching one of these still trips `changed`. This is how an
+  // operator lists ignored secrets (`.env`, `*.key`, `vertex-ai-sa.json`,
+  // `tmp/local_secret.txt`, `vaults/local_encryption/`) that must stay
+  // byte-identical across an attended invocation.
   allowedIgnoredPaths: z.array(PathString).max(MAX_PATHS).default([]),
   allowedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS).default([]),
   excludedIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS).default([]),
+  // Permitted to exist AND permitted to vary: a path matching one of these
+  // prefixes is never folded into `stateHash`, so its content, appearance, or
+  // disappearance cannot fail certification. For volatile, policy-approved
+  // build byproducts (e.g. `log/`, `tmp/cache/`) that legitimately change
+  // during the invocation being certified but carry no secret content worth
+  // pinning. Distinct from `excludedIgnoredPathPrefixes`: excluded prefixes
+  // are pruned at the Git listing layer and validated to exist on disk and
+  // contain no tracked paths; a may-vary prefix carries neither requirement —
+  // it may be empty, may not exist yet, and may coexist with a tracked
+  // `.gitkeep` under the same directory (the tracked file is still covered by
+  // the ordinary tracked-diff check; only the *ignored* files beneath a
+  // may-vary prefix are exempt from `stateHash`).
+  mayVaryIgnoredPathPrefixes: z.array(PathString).max(MAX_PATHS).default([]),
 }).strict();
 
 type ModelContext = {
@@ -684,6 +704,12 @@ async function validateExcludedIgnoredPrefixes(
   }
 }
 
+/**
+ * Whether an ignored path is permitted to exist at all — allow-listed
+ * (content-pinned) or may-vary (content-exempt). Both are "not a policy
+ * violation"; `ignoredMayVary` distinguishes which of the two once that
+ * question matters (whether the path's content is folded into `stateHash`).
+ */
 function ignoredAllowed(
   path: string,
   exact: Set<string>,
@@ -692,10 +718,35 @@ function ignoredAllowed(
   return exact.has(path) || prefixes.some((prefix) => path.startsWith(prefix));
 }
 
+/**
+ * Whether an ignored path falls under a may-vary prefix: permitted to exist
+ * AND permitted to change content, because it is exempt from `stateHash`
+ * entirely (see `ignoredSnapshot`'s `paths` argument — callers filter these
+ * out before hashing, they never reach this function's caller-side use as a
+ * hash-population filter). Kept separate from `ignoredAllowed` so a strict
+ * allow-listed secret and a may-vary log/cache path are never conflated.
+ */
+function ignoredMayVary(path: string, mayVaryPrefixes: string[]): boolean {
+  return mayVaryPrefixes.some((prefix) => path.startsWith(prefix));
+}
+
+/**
+ * Fold ignored-path state into `stateHash`.
+ *
+ * `paths` is the ALREADY-FILTERED population the caller wants bound into the
+ * comparable snapshot: it must exclude any may-vary path before calling this,
+ * so a may-vary path's content (or its appearance/disappearance) never enters
+ * `stateHash` and can never fail the `changed`/`stable` comparison. An
+ * allow-listed path is NOT filtered out here — it stays content-pinned, which
+ * is the point of the allow-list category (e.g. secrets: `.env`, `*.key`,
+ * `vertex-ai-sa.json`) as distinct from the may-vary category (e.g. an
+ * `rspec` run legitimately writing to a may-vary `log/test.log` mid-build).
+ */
 async function ignoredSnapshot(
   cwd: string,
   paths: string[],
   excludedPrefixes: string[],
+  mayVaryPrefixes: string[],
   packetId: string,
   invocationId: string,
   resolvedBaseSha: string,
@@ -732,6 +783,7 @@ async function ignoredSnapshot(
     stateHash: await canonicalHash(parts),
     ignoredScope: IGNORED_SCOPE,
     excludedIgnoredPathPrefixes: excludedPrefixes,
+    mayVaryIgnoredPathPrefixes: mayVaryPrefixes,
   };
 }
 
@@ -1327,13 +1379,19 @@ async function captureWorktreeEvidence(
  */
 function ignoredPolicy(
   context: ModelContext,
-): { exact: Set<string>; prefixes: string[]; excludedPrefixes: string[] } {
+): {
+  exact: Set<string>;
+  prefixes: string[];
+  excludedPrefixes: string[];
+  mayVaryPrefixes: string[];
+} {
   const exact = context.globalArgs?.allowedIgnoredPaths ?? [];
   const prefixes = context.globalArgs?.allowedIgnoredPathPrefixes ?? [];
   const excludedPrefixes = context.globalArgs?.excludedIgnoredPathPrefixes ??
     [];
+  const mayVaryPrefixes = context.globalArgs?.mayVaryIgnoredPathPrefixes ?? [];
   for (const path of exact) validateRepoPath(path);
-  for (const prefix of [...prefixes, ...excludedPrefixes]) {
+  for (const prefix of [...prefixes, ...excludedPrefixes, ...mayVaryPrefixes]) {
     if (!prefix.endsWith("/")) {
       throw new Error("ignored path prefix must end with /");
     }
@@ -1344,6 +1402,9 @@ function ignoredPolicy(
   }
   if (new Set(excludedPrefixes).size !== excludedPrefixes.length) {
     throw new Error("excluded ignored path prefixes must be unique");
+  }
+  if (new Set(mayVaryPrefixes).size !== mayVaryPrefixes.length) {
+    throw new Error("may-vary ignored path prefixes must be unique");
   }
   for (const prefix of excludedPrefixes) {
     if (
@@ -1366,17 +1427,51 @@ function ignoredPolicy(
       throw new Error("allowed and excluded ignored path policies overlap");
     }
   }
+  // A may-vary prefix may overlap an excluded prefix (excluded wins:
+  // listIgnoredPaths prunes those paths before any policy category ever sees
+  // them, so nothing under an excluded prefix reaches the may-vary check).
+  // But a may-vary prefix must NOT overlap an allow-listed exact path or
+  // prefix: may-vary exempts a path from stateHash, so an overlap would
+  // silently un-pin a path the operator content-pinned on purpose (e.g. a
+  // secret at config/secrets/.env exempted by a may-vary config/ prefix).
+  // Content-pinning and content-exemption are contradictory intents for the
+  // same path; forbid the overlap so exempting a pinned path is an explicit,
+  // deliberate policy edit rather than an accident. (Redundant may-vary
+  // bookkeeping — one may-vary prefix covering another — is also rejected.)
+  for (const prefix of mayVaryPrefixes) {
+    if (
+      [...exact].some((path) => path.startsWith(prefix)) ||
+      prefixes.some((allowed) =>
+        prefix.startsWith(allowed) || allowed.startsWith(prefix)
+      )
+    ) {
+      throw new Error(
+        "allowed and may-vary ignored path policies overlap: a content-pinned " +
+          `path cannot also be may-vary (${prefix})`,
+      );
+    }
+    if (
+      mayVaryPrefixes.some((other) =>
+        other !== prefix && prefix.startsWith(other)
+      )
+    ) {
+      throw new Error(
+        `may-vary ignored path prefix is already covered: ${prefix}`,
+      );
+    }
+  }
   return {
     exact: new Set(exact),
     prefixes,
     excludedPrefixes: excludedPrefixes.toSorted(),
+    mayVaryPrefixes: mayVaryPrefixes.toSorted(),
   };
 }
 
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.08.08.1",
+  version: "2026.08.14.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1428,6 +1523,14 @@ export const model = {
     description:
       "Raise candidate byte ceilings, extend the Git command timeout, and disable the commit-graph cache for CompanyCam-scale repositories",
     upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.08.14.1",
+    description:
+      "Add may-vary ignored-path category (stateHash-exempt) so volatile build byproducts (logs, caches) can change without failing certification, while allow-listed paths stay content-pinned",
+    upgradeAttributes: (old: Record<string, unknown>) => ({
+      ...old,
+      mayVaryIgnoredPathPrefixes: [],
+    }),
   }],
   resources: {
     ignoredSnapshot: {
@@ -1491,19 +1594,30 @@ export const model = {
           excludeRuntimeSwamp,
           policy.excludedPrefixes,
         );
+        // Permitted to exist: allow-listed (content-pinned) OR may-vary
+        // (content-exempt). Anything else is an unpermitted ignored path.
         const violation = paths.find((path) =>
-          !ignoredAllowed(path, policy.exact, policy.prefixes)
+          !ignoredAllowed(path, policy.exact, policy.prefixes) &&
+          !ignoredMayVary(path, policy.mayVaryPrefixes)
         );
         if (violation) {
           throw new Error(
             `ignored path is not permitted by policy: ${violation}`,
           );
         }
+        // May-vary paths are excluded from the population bound into
+        // stateHash: they are permitted to change (or appear/disappear)
+        // without affecting `changed`. Allow-listed paths remain in the
+        // hashed population — they stay content-pinned.
+        const hashedPaths = paths.filter((path) =>
+          !ignoredMayVary(path, policy.mayVaryPrefixes)
+        );
         const snapshot = IgnoredSnapshotSchema.parse({
           ...await ignoredSnapshot(
             cwd,
-            paths,
+            hashedPaths,
             policy.excludedPrefixes,
+            policy.mayVaryPrefixes,
             packetId,
             invocationId,
             resolvedBaseSha,
@@ -1596,6 +1710,19 @@ export const model = {
             "excluded ignored path policy differs from pre-invocation snapshot",
           );
         }
+        // May-vary prefixes decide which ignored paths were excluded from the
+        // snapshot's stateHash population; a policy change here would make
+        // `expected` and `current` non-comparable in ways JSON equality alone
+        // could not detect (e.g. a path becoming exempt would silently drop
+        // out of `current` without `expected` changing to match).
+        if (
+          JSON.stringify(expected.mayVaryIgnoredPathPrefixes) !==
+            JSON.stringify(policy.mayVaryPrefixes)
+        ) {
+          throw new Error(
+            "may-vary ignored path policy differs from pre-invocation snapshot",
+          );
+        }
         await validateExcludedIgnoredPrefixes(cwd, policy.excludedPrefixes);
         const base = expected.resolvedBaseSha;
         await command(cwd, "git fsck base", [
@@ -1626,8 +1753,19 @@ export const model = {
           new Set(ignoredPaths),
           expected.objectFormat,
         );
+        // Permitted to exist: allow-listed (content-pinned) OR may-vary
+        // (content-exempt); anything else is an unpermitted ignored path.
+        // This is separate from, and unaffected by, the stateHash population
+        // below — a may-vary path is never a violation, but it also never
+        // reaches stateHash.
         const ignoredPathViolations = ignoredPaths.filter((path) =>
-          !ignoredAllowed(path, policy.exact, policy.prefixes)
+          !ignoredAllowed(path, policy.exact, policy.prefixes) &&
+          !ignoredMayVary(path, policy.mayVaryPrefixes)
+        );
+        // May-vary paths are excluded from the hashed population, mirroring
+        // snapshotIgnoredState: they may change or appear/disappear freely.
+        const hashedPaths = ignoredPaths.filter((path) =>
+          !ignoredMayVary(path, policy.mayVaryPrefixes)
         );
         // Do not read disallowed ignored files.
         const current = ignoredPathViolations.length
@@ -1638,15 +1776,17 @@ export const model = {
             resolvedBaseSha: base,
             objectFormat: expected.objectFormat,
             rootBinding: await rootBinding(cwd),
-            fileCount: ignoredPaths.length,
+            fileCount: hashedPaths.length,
             stateHash: await canonicalHash([]),
             ignoredScope: IGNORED_SCOPE,
             excludedIgnoredPathPrefixes: policy.excludedPrefixes,
+            mayVaryIgnoredPathPrefixes: policy.mayVaryPrefixes,
           }
           : await ignoredSnapshot(
             cwd,
-            ignoredPaths,
+            hashedPaths,
             policy.excludedPrefixes,
+            policy.mayVaryPrefixes,
             packetId,
             snapshotInvocationId,
             base,
@@ -1656,8 +1796,9 @@ export const model = {
           ? current
           : await ignoredSnapshot(
             cwd,
-            ignoredPaths,
+            hashedPaths,
             policy.excludedPrefixes,
+            policy.mayVaryPrefixes,
             packetId,
             snapshotInvocationId,
             base,
@@ -1755,6 +1896,7 @@ export const model = {
             allowedIgnoredPaths: [...policy.exact],
             allowedIgnoredPathPrefixes: policy.prefixes,
             excludedIgnoredPathPrefixes: policy.excludedPrefixes,
+            mayVaryIgnoredPathPrefixes: policy.mayVaryPrefixes,
           },
           passed,
           checkedAt: new Date().toISOString(),
