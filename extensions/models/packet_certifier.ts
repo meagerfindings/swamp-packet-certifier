@@ -113,7 +113,7 @@ const ReportSchema = z.object({
   resolvedBaseSha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
   effectivePolicy: z.object({
     allowedPaths: z.array(PathString).min(1).max(MAX_PATHS),
-    maxChangedFiles: z.number().int().min(1).max(20),
+    maxChangedFiles: z.number().int().min(1).max(25),
     maxChangedLines: z.number().int().min(1).max(2_000),
     checks: z.array(
       z.object({
@@ -1471,7 +1471,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.08.14.1",
+  version: "2026.08.16.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1531,6 +1531,10 @@ export const model = {
       ...old,
       mayVaryIgnoredPathPrefixes: [],
     }),
+  }, {
+    toVersion: "2026.08.16.1",
+    description: "Raise the maximum packet file budget from 20 to 25",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
     ignoredSnapshot: {
@@ -1649,7 +1653,7 @@ export const model = {
           "Invocation identity of the original pre-agent ignored-state snapshot; defaults to invocationId",
         ),
         allowedPaths: z.array(PathString).min(1).max(MAX_PATHS),
-        maxChangedFiles: z.number().int().min(1).max(20).default(3),
+        maxChangedFiles: z.number().int().min(1).max(25).default(3),
         maxChangedLines: z.number().int().min(1).max(2_000).default(120),
         checks: z.array(
           z.object({

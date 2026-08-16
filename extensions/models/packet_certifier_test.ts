@@ -377,6 +377,30 @@ Deno.test("method schemas accept Swamp-injected global arguments", () => {
   );
 });
 
+Deno.test("certify schema permits packets of up to 25 changed files", () => {
+  const baseArgs = {
+    cwd: "/tmp/repo",
+    packetId: "packet",
+    invocationId: "call",
+    allowedPaths: ["README.md"],
+  };
+
+  assertEquals(
+    model.methods.certify.arguments.safeParse({
+      ...baseArgs,
+      maxChangedFiles: 25,
+    }).success,
+    true,
+  );
+  assertEquals(
+    model.methods.certify.arguments.safeParse({
+      ...baseArgs,
+      maxChangedFiles: 26,
+    }).success,
+    false,
+  );
+});
+
 Deno.test("excludes Swamp-owned runtime state from ignored-state protection", async () => {
   const cwd = await createRepo();
   try {
