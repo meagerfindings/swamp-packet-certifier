@@ -32,7 +32,7 @@ const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
 // can outrun a 30s abort on real CompanyCam-scale monorepos. This governs the
 // AbortController deadline for every `command()` invocation below, including
 // the one that carries `core.commitGraph=false`.
-const COMMAND_TIMEOUT_MS = 60_000;
+const COMMAND_TIMEOUT_MS = 180_000;
 const MAX_TOTAL_LINE_DIFF_STEPS = 20_000_000;
 const IGNORED_SCOPE = "application-owned-v1";
 
@@ -114,7 +114,7 @@ const ReportSchema = z.object({
   effectivePolicy: z.object({
     allowedPaths: z.array(PathString).min(1).max(MAX_PATHS),
     maxChangedFiles: z.number().int().min(1).max(25),
-    maxChangedLines: z.number().int().min(1).max(2_000),
+    maxChangedLines: z.number().int().min(1).max(5_000),
     checks: z.array(
       z.object({
         name: ShortString,
@@ -1471,7 +1471,7 @@ function ignoredPolicy(
 /** Swamp model definition. */
 export const model = {
   type: "@mgreten/packet-certifier",
-  version: "2026.08.16.1",
+  version: "2026.09.02.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.07.24.3",
@@ -1534,6 +1534,11 @@ export const model = {
   }, {
     toVersion: "2026.08.16.1",
     description: "Raise the maximum packet file budget from 20 to 25",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.09.02.1",
+    description:
+      "Raise the Git command timeout and maximum generated packet line budget",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   resources: {
@@ -1654,7 +1659,7 @@ export const model = {
         ),
         allowedPaths: z.array(PathString).min(1).max(MAX_PATHS),
         maxChangedFiles: z.number().int().min(1).max(25).default(3),
-        maxChangedLines: z.number().int().min(1).max(2_000).default(120),
+        maxChangedLines: z.number().int().min(1).max(5_000).default(120),
         checks: z.array(
           z.object({
             name: ShortString,

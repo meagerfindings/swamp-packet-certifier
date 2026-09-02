@@ -401,6 +401,30 @@ Deno.test("certify schema permits packets of up to 25 changed files", () => {
   );
 });
 
+Deno.test("certify schema permits generated packets of up to 5,000 changed lines", () => {
+  const baseArgs = {
+    cwd: "/tmp/repo",
+    packetId: "packet",
+    invocationId: "call",
+    allowedPaths: ["README.md"],
+  };
+
+  assertEquals(
+    model.methods.certify.arguments.safeParse({
+      ...baseArgs,
+      maxChangedLines: 5_000,
+    }).success,
+    true,
+  );
+  assertEquals(
+    model.methods.certify.arguments.safeParse({
+      ...baseArgs,
+      maxChangedLines: 5_001,
+    }).success,
+    false,
+  );
+});
+
 Deno.test("excludes Swamp-owned runtime state from ignored-state protection", async () => {
   const cwd = await createRepo();
   try {
@@ -1929,7 +1953,7 @@ Deno.test("counts insertions, deletions, empty files, and newline changes", asyn
 
 /**
  * Install a `git` shim ahead of the real binary on PATH that sleeps once
- * (past the former 30s COMMAND_TIMEOUT_MS but under the current 60s one)
+ * (past the former 30s COMMAND_TIMEOUT_MS but under the current 180s one)
  * before delegating to the real `git` for every invocation, including the
  * one it delayed. Callers must restore PATH in a `finally` so a failed test
  * cannot leak the override into later tests.
@@ -1964,7 +1988,7 @@ async function installSlowGitOnce(
 
 Deno.test({
   name:
-    "certifies successfully when one Git invocation takes longer than the former 30s timeout but under the raised 60s one",
+    "certifies successfully when one Git invocation takes longer than the former 30s timeout but under the raised 180s one",
   ignore: Deno.build.os === "windows",
   fn: async () => {
     const cwd = await createRepo();
@@ -1984,7 +2008,7 @@ Deno.test({
 
 Deno.test({
   name:
-    "a Git invocation past the 60s ceiling fails closed (generic failure; typed timeout is a tracked follow-up)",
+    "a Git invocation past the 180s ceiling fails closed (generic failure; typed timeout is a tracked follow-up)",
   ignore: Deno.build.os === "windows",
   fn: async () => {
     // command()'s catch block collapses an AbortController timeout and an
@@ -1997,10 +2021,10 @@ Deno.test({
     // A shim that never delegates simulates a hung Git process (e.g. lock
     // contention, a stalled filesystem). COMMAND_TIMEOUT_MS is not
     // test-injectable (it is a module-level const, and the model exports
-    // only `model`), so this test genuinely waits out the real 60s abort
+    // only `model`), so this test genuinely waits out the real 180s abort
     // deadline rather than a shortened one — it is a slow, real-time test by
     // necessity, not by oversight. The shim sleeps 600s so the wait is
-    // bounded by the abort at 60s rather than by the shim's own sleep.
+    // bounded by the abort at 180s rather than by the shim's own sleep.
     // `exec` replaces the shell's own process image with `sleep`, so the
     // AbortController's SIGTERM lands on the process actually holding the
     // stdout/stderr pipes open — a bare (non-exec'd) `sleep` would run as a
