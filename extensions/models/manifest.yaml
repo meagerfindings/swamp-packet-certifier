@@ -1,11 +1,12 @@
 manifestVersion: 1
 name: "@mgreten/packet-certifier"
-version: "2026.09.02.1"
+version: "2026.10.14.1"
 description: >
   Certify that an agent implementation packet changed only approved Git paths,
   stayed within file and line budgets, and preserved ignored runtime state.
 
 repository: https://github.com/meagerfindings/swamp-packet-certifier
+license: MIT
 
 models:
   - packet_certifier.ts
